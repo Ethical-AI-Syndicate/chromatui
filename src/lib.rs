@@ -1,3 +1,4 @@
+pub mod inline;
 pub mod kernel;
 pub mod renderer;
 pub mod runtime;
