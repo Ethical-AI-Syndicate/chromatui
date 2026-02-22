@@ -1,4 +1,4 @@
-use crate::kernel::types::{Event, Key};
+use crate::kernel::types::Event;
 use std::io::Write;
 
 pub trait TerminalBackend {
@@ -31,7 +31,7 @@ impl TerminalBackend for StdoutBackend {
         self.size
     }
 
-    fn set_raw_mode(&mut self, enabled: bool) -> std::io::Result<()> {
+    fn set_raw_mode(&mut self, _enabled: bool) -> std::io::Result<()> {
         Ok(())
     }
 }
