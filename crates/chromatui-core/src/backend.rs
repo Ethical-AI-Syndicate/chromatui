@@ -328,11 +328,15 @@ impl<W: Write> TerminalWriter<W> {
         match self.mode {
             OutputMode::Inline => {
                 writer.write_all(b"\r")?;
+                writer.write_all(b"\x1b[?2026h")?;
                 writer.write_all(ansi_bytes)?;
+                writer.write_all(b"\x1b[?2026l")?;
                 writer.write_all(b"\n")?;
             }
             OutputMode::AltScreen => {
+                writer.write_all(b"\x1b[?2026h")?;
                 writer.write_all(ansi_bytes)?;
+                writer.write_all(b"\x1b[?2026l")?;
             }
         }
         writer.flush()
@@ -397,7 +401,7 @@ mod writer_tests {
             .write_frame(b"abc")
             .expect("write_frame should succeed");
         let bytes = writer.into_inner();
-        assert_eq!(bytes, b"\rabc\n");
+        assert_eq!(bytes, b"\r\x1b[?2026habc\x1b[?2026l\n");
     }
 
     #[test]
@@ -411,6 +415,6 @@ mod writer_tests {
             .write_frame(b"\x1b[1;1Hok")
             .expect("write_frame should succeed");
         let bytes = writer.into_inner();
-        assert_eq!(bytes, b"\x1b[1;1Hok");
+        assert_eq!(bytes, b"\x1b[?2026h\x1b[1;1Hok\x1b[?2026l");
     }
 }

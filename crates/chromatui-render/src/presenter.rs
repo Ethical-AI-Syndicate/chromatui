@@ -33,11 +33,37 @@ impl AnsiPresenter {
                 }
 
                 let end = end.min(line_bytes.len());
-                let slice = &line_bytes[start..end];
-
                 self.move_cursor(&mut out, row + 1, region.start_col + 1);
-                out.extend_from_slice(slice);
-                self.cursor = Some((row + 1, region.start_col + 1 + slice.len() as u16));
+
+                let row_links = content.links.get(row as usize);
+                let mut i = start;
+                while i < end {
+                    let current_link = row_links
+                        .and_then(|links| links.get(i))
+                        .and_then(|opt| opt.as_deref());
+                    let mut j = i + 1;
+                    while j < end {
+                        let link_j = row_links
+                            .and_then(|links| links.get(j))
+                            .and_then(|opt| opt.as_deref());
+                        if link_j != current_link {
+                            break;
+                        }
+                        j += 1;
+                    }
+
+                    let slice = &line_bytes[i..j];
+                    if let Some(url) = current_link {
+                        out.extend_from_slice(format!("\x1b]8;;{}\x1b\\", url).as_bytes());
+                        out.extend_from_slice(slice);
+                        out.extend_from_slice(b"\x1b]8;;\x1b\\");
+                    } else {
+                        out.extend_from_slice(slice);
+                    }
+                    i = j;
+                }
+
+                self.cursor = Some((row + 1, region.start_col + 1 + (end - start) as u16));
             }
         }
 
@@ -85,5 +111,24 @@ mod tests {
         let mut presenter2 = AnsiPresenter::new();
         let second = presenter2.encode_regions(&content, &regions);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn encodes_osc8_for_linked_runs() {
+        let mut presenter = AnsiPresenter::new();
+        let content = Content::from_lines_with_links(
+            vec!["abc".to_string()],
+            vec![vec![
+                Some("https://example.com".to_string()),
+                Some("https://example.com".to_string()),
+                None,
+            ]],
+        );
+        let regions = vec![Region::new(0, 0, 1, 3)];
+        let bytes = presenter.encode_regions(&content, &regions);
+        let rendered = String::from_utf8(bytes).expect("presenter output must be UTF-8/ASCII");
+
+        assert!(rendered.contains("\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\"));
+        assert!(rendered.ends_with('c'));
     }
 }

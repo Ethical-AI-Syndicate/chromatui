@@ -634,6 +634,85 @@ pub struct CommandPalette {
     entries: Vec<CommandEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModalDialog {
+    pub title: String,
+}
+
+impl ModalDialog {
+    pub fn new(title: &str) -> Self {
+        Self {
+            title: title.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModalStack {
+    stack: Vec<ModalDialog>,
+}
+
+impl ModalStack {
+    pub fn new() -> Self {
+        Self { stack: Vec::new() }
+    }
+
+    pub fn push(&mut self, modal: ModalDialog) {
+        self.stack.push(modal);
+    }
+
+    pub fn pop(&mut self) -> Option<ModalDialog> {
+        self.stack.pop()
+    }
+
+    pub fn top(&self) -> Option<&ModalDialog> {
+        self.stack.last()
+    }
+
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    pub fn captures_input(&self) -> bool {
+        !self.stack.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TimeTravelRecorder {
+    frames: Vec<String>,
+    cursor: Option<usize>,
+}
+
+impl TimeTravelRecorder {
+    pub fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    pub fn record(&mut self, frame: &str) {
+        self.frames.push(frame.to_string());
+        self.cursor = Some(self.frames.len() - 1);
+    }
+
+    pub fn seek(&mut self, idx: usize) -> bool {
+        if idx < self.frames.len() {
+            self.cursor = Some(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn current(&self) -> Option<&str> {
+        self.cursor
+            .and_then(|i| self.frames.get(i))
+            .map(String::as_str)
+    }
+}
+
 impl CommandPalette {
     pub fn new() -> Self {
         Self {
@@ -916,5 +995,35 @@ mod tests {
         let ranked = cp.search("Open File");
         assert_eq!(ranked.first().map(|r| r.title.as_str()), Some("Open File"));
         assert!(!ranked[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn modal_stack_is_lifo_and_captures_input() {
+        let mut stack = ModalStack::new();
+        stack.push(ModalDialog::new("Delete file?"));
+        stack.push(ModalDialog::new("Confirm delete"));
+
+        assert_eq!(stack.len(), 2);
+        assert_eq!(
+            stack.top().map(|m| m.title.as_str()),
+            Some("Confirm delete")
+        );
+        assert!(stack.captures_input());
+
+        let popped = stack.pop().expect("top modal should exist");
+        assert_eq!(popped.title, "Confirm delete");
+        assert_eq!(stack.top().map(|m| m.title.as_str()), Some("Delete file?"));
+    }
+
+    #[test]
+    fn time_travel_recorder_can_seek() {
+        let mut tt = TimeTravelRecorder::new();
+        tt.record("frame-a");
+        tt.record("frame-b");
+        tt.record("frame-c");
+
+        assert_eq!(tt.current(), Some("frame-c"));
+        assert!(tt.seek(0));
+        assert_eq!(tt.current(), Some("frame-a"));
     }
 }

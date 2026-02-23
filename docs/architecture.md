@@ -338,3 +338,141 @@ Intervention trigger:
 if input_latency > threshold OR F < 0.8:
     force_coalescer_yield()
 ```
+
+## Core Algorithms and Data Structures
+
+ChromaTUI is not treated as a generic widget toolkit. It is engineered around terminal-specific cost models, deterministic update loops, and low-overhead data structures.
+
+Use `docs/conformance-matrix.md` as the source of truth for what is currently implemented as `PASS` versus still under hardening.
+
+### Math-Driven Performance
+
+The operating principle is to spend small, bounded compute on principled decisions that avoid larger downstream costs (extra scans, ANSI bytes, redundant renders, unstable ranking, or jitter).
+
+## Additional Math Systems (Reference Catalog)
+
+### Presenter Cost Modeling (Cursor/Byte Economy)
+
+```text
+cost = c_scan * N_scan + c_emit * N_emit
+```
+
+Choose emission strategy by minimizing byte and cursor movement cost (sparse runs vs merged runs).
+
+### BOCPD Run-Length Posterior + Hazard (Core Form)
+
+```text
+H(r) = 1/lambda
+
+P(r_t = 0 | x_1:t)
+  proportional to Sum_r P(r_{t-1}=r) * H(r) * P(x_t | r)
+
+P(r_t = r | x_1:t)
+  proportional to P(r_{t-1}=r-1) * (1 - H(r-1)) * P(x_t | r)
+```
+
+### GRAPA (Adaptive Betting Fraction)
+
+```text
+lambda_{t+1} = lambda_t + eta * gradient_lambda log(W_t)
+```
+
+Used to adapt e-process sensitivity while preserving anytime-valid behavior.
+
+### PID / PI Frame Pacing
+
+```text
+u_t = Kp * e_t + Ki * Sum e_t + Kd * Delta e_t
+```
+
+PI is the default practical controller in most terminal workloads.
+
+### MPC Evaluation Objective
+
+```text
+min_{u_t:t+H} Sum_{k=0..H} |y_{t+k} - y*|^2 + rho * |u_{t+k}|^2
+```
+
+MPC is evaluated as a benchmark control strategy against PI to validate tradeoffs.
+
+### Count-Min Sketch (Approximate Frequency)
+
+```text
+f_hat(x) = min_j C[j, h_j(x)]
+```
+
+### PAC-Bayes Calibration (Bound Tightening)
+
+```text
+E[err] <= err_bar + KL(q || p) / (2n)
+```
+
+### Scheduling Math (Smith's Rule + Aging)
+
+```text
+priority = w/r + a * wait
+```
+
+Improves throughput while preventing starvation.
+
+## Visual FX Math (Reference)
+
+These equations are the deterministic reference for visual effects modules.
+
+| Effect | Core Equation | Output |
+|---|---|---|
+| Metaballs | `F(x,y)=Sum_i r_i^2/((x-x_i)^2+(y-y_i)^2), render F>=tau` | Smooth blob fields |
+| Plasma | `v=(1/6) Sum_{k=1..6} sin(phi_k(x,y,t))` | Interference bands |
+| Gray-Scott | `du/dt=Du Lap(u)-u v^2+F(1-u)`, `dv/dt=Dv Lap(v)+u v^2-(F+k)v` | Reaction-diffusion patterns |
+| Clifford attractor | `x_{t+1}=sin(a y_t)+c cos(a x_t)`, `y_{t+1}=sin(b x_t)+d cos(b y_t)` | Chaotic filaments |
+| Mandelbrot/Julia | `z_{n+1}=z_n^2+c` | Fractal boundaries |
+| Lissajous/Harmonograph | `x=A sin(a t+delta)`, `y=B sin(b t+phi)` | Phase curves |
+| Flow field | `v=(cos 2piN, sin 2piN)`, `p_{t+1}=p_t+v dt` | Particle ribbons |
+| Wave interference | `I(x,t)=Sum_i sin(k_i |x-s_i| - omega_i t)` | Ripple superposition |
+| Spiral galaxy | `r=a e^{b theta}`, `theta(t)=theta_0+omega t` | Spiral starfields |
+| Spin lattice (LLG) | `dS/dt=-SxH-alpha Sx(SxH)` | Domain dynamics |
+
+## Cell Layout and Diff Mechanics
+
+### 16-Byte Cell Target
+
+The renderer is designed around a 16-byte logical cell budget to optimize cache locality and equality checks.
+
+```text
+CellContent (4B) | fg (4B) | bg (4B) | attrs (2B) | link_id (2B)
+```
+
+### Block-Based Diff
+
+Diffing is row-first with fast-skip on identical rows and coalesced runs for changed segments.
+
+```text
+for each row:
+  if rows_equal(old, new): continue
+  scan blocks
+  coalesce adjacent changes into runs
+```
+
+## Runtime Architecture Pattern (Elm-Style)
+
+ChromaTUI uses an update/view command loop with explicit side effects and subscriptions.
+
+```text
+Event -> update(Model) -> Cmd
+Model -> view() -> Frame -> BufferDiff -> Presenter
+Cmd -> Effects -> Event stream
+```
+
+## Safety and Correctness Standards
+
+- Prefer `#![forbid(unsafe_code)]` in core runtime/render crates.
+- Use saturating/checked arithmetic for coordinates and dimensions.
+- Preserve no-flicker guarantees through deterministic frame boundaries and synchronized output behavior.
+- Keep proof-oriented regression tests for diff completeness, dirty-tracking soundness, and deterministic presenter output.
+
+## Performance and Validation Notes
+
+- Dirty-row tracking is O(1) on mutation and reduces scan work in sparse frames.
+- Grapheme pooling and deduplication reduce repeated width/cell overhead.
+- Synchronized output mode prevents partial-frame visibility.
+- Use benchmark and snapshot suites to verify throughput, correctness, and render stability over time.

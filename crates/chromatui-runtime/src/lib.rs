@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use chromatui_algorithms::bocpd::{Regime, RegimeDetector};
 use chromatui_algorithms::conformal::{ConformalAlerter, MondrianBucket, MondrianRiskGate};
+use chromatui_algorithms::control::{MpcEvaluator, PidController};
 use chromatui_algorithms::cusum::CusumDetector;
 use chromatui_algorithms::diff::SummedAreaTable;
 use chromatui_algorithms::eprocess::EProcess;
@@ -474,18 +475,31 @@ fn dirty_rows_from_regions(regions: &[Region]) -> usize {
 
 pub fn frame_to_content(frame: &Frame) -> Content {
     let mut lines = Vec::with_capacity(frame.height as usize);
+    let mut links = Vec::with_capacity(frame.height as usize);
 
     for y in 0..frame.height {
         let mut line = String::with_capacity(frame.width as usize);
+        let mut line_links = Vec::with_capacity(frame.width as usize);
         for x in 0..frame.width {
             let idx = (y as usize) * (frame.width as usize) + (x as usize);
-            let ch = frame.cells.get(idx).map(|c| c.ch).unwrap_or(' ');
+            let cell = frame.cells.get(idx).copied().unwrap_or_default();
+            let ch = cell.ch;
             line.push(if ch == '\0' { ' ' } else { ch });
+            let link = if cell.link_id == u16::MAX {
+                None
+            } else {
+                frame
+                    .link_registry_ref()
+                    .get(cell.link_id)
+                    .map(|s| s.to_string())
+            };
+            line_links.push(link);
         }
         lines.push(line);
+        links.push(line_links);
     }
 
-    Content::from_lines(lines)
+    Content::from_lines_with_links(lines, links)
 }
 
 pub struct DeterministicRuntime<M: Model, W: Write> {
@@ -498,6 +512,8 @@ pub struct DeterministicRuntime<M: Model, W: Write> {
     risk_gate: MondrianRiskGate,
     frame_budget_ms: f64,
     predicted_frame_ms: f64,
+    pacing_pi: PidController,
+    mpc_eval: MpcEvaluator,
     fairness_guard: InputFairnessGuard,
     frame_cusum: CusumDetector,
     frame_eprocess: EProcess,
@@ -520,6 +536,8 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             risk_gate: MondrianRiskGate::new(0.1),
             frame_budget_ms: 16.7,
             predicted_frame_ms: 16.7,
+            pacing_pi: PidController::pi_default(),
+            mpc_eval: MpcEvaluator::new(8, 0.1),
             fairness_guard: InputFairnessGuard::new(),
             frame_cusum: CusumDetector::with_params(0.5, 5.0, 0.0),
             frame_eprocess: EProcess::with_params(0.1, 0.0),
@@ -608,6 +626,15 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             .is_risky(&bucket, self.predicted_frame_ms, self.frame_budget_ms);
 
         self.predicted_frame_ms = 0.8 * self.predicted_frame_ms + 0.2 * observed_frame_ms;
+        let error = self.frame_budget_ms - observed_frame_ms;
+        let control = self.pacing_pi.update(error, 1.0 / 60.0);
+        self.frame_budget_ms = (self.frame_budget_ms - 0.05 * control).clamp(8.0, 33.3);
+
+        let _mpc_cost = self.mpc_eval.objective(
+            &[self.predicted_frame_ms; 8],
+            self.frame_budget_ms,
+            &[control; 8],
+        );
         let fairness = self.fairness_guard.fairness();
 
         let delta = observed_frame_ms - self.frame_budget_ms;

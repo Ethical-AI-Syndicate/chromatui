@@ -1,3 +1,4 @@
+use std::mem::size_of;
 use std::time::Duration;
 
 use crate::types::Event;
@@ -177,6 +178,7 @@ pub struct Frame {
     pub width: u16,
     pub height: u16,
     pub cells: Vec<Cell>,
+    link_registry: LinkRegistry,
 }
 
 impl Frame {
@@ -186,6 +188,7 @@ impl Frame {
             width,
             height,
             cells: vec![Cell::default(); capacity],
+            link_registry: LinkRegistry::new(),
         }
     }
 
@@ -203,6 +206,14 @@ impl Frame {
             *cell = Cell::default();
         }
     }
+
+    pub fn link_registry(&mut self) -> &mut LinkRegistry {
+        &mut self.link_registry
+    }
+
+    pub fn link_registry_ref(&self) -> &LinkRegistry {
+        &self.link_registry
+    }
 }
 
 impl Default for Frame {
@@ -211,7 +222,7 @@ impl Default for Frame {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
     pub fg: Color,
@@ -219,6 +230,70 @@ pub struct Cell {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub link_id: u16,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            ch: '\0',
+            fg: Color::default(),
+            bg: Color::default(),
+            bold: false,
+            italic: false,
+            underline: false,
+            link_id: u16::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct PackedCell16 {
+    pub ch: u32,
+    pub fg: u32,
+    pub bg: u32,
+    pub attrs: u16,
+    pub link_id: u16,
+}
+
+impl PackedCell16 {
+    pub fn from_cell(cell: Cell) -> Self {
+        let attrs =
+            (cell.bold as u16) | ((cell.italic as u16) << 1) | ((cell.underline as u16) << 2);
+        Self {
+            ch: cell.ch as u32,
+            fg: u32::from(cell.fg.0) << 16 | u32::from(cell.fg.1) << 8 | u32::from(cell.fg.2),
+            bg: u32::from(cell.bg.0) << 16 | u32::from(cell.bg.1) << 8 | u32::from(cell.bg.2),
+            attrs,
+            link_id: cell.link_id,
+        }
+    }
+}
+
+const _: [(); 16] = [(); size_of::<PackedCell16>()];
+
+#[derive(Debug, Clone, Default)]
+pub struct LinkRegistry {
+    links: Vec<String>,
+}
+
+impl LinkRegistry {
+    pub fn new() -> Self {
+        Self { links: Vec::new() }
+    }
+
+    pub fn register(&mut self, url: &str) -> u16 {
+        if let Some((idx, _)) = self.links.iter().enumerate().find(|(_, u)| *u == url) {
+            return idx as u16;
+        }
+        self.links.push(url.to_string());
+        (self.links.len() - 1) as u16
+    }
+
+    pub fn get(&self, id: u16) -> Option<&str> {
+        self.links.get(id as usize).map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -368,5 +443,18 @@ mod tests {
         }
         frame.clear();
         assert_eq!(frame.cell(0, 0).unwrap().ch, '\0');
+    }
+
+    #[test]
+    fn test_link_registry_round_trip() {
+        let mut frame = Frame::new(4, 2);
+        let id = frame.link_registry().register("https://example.com");
+        frame.cell(0, 0).expect("cell should exist").link_id = id;
+
+        let resolved = frame
+            .link_registry()
+            .get(id)
+            .expect("link id should resolve");
+        assert_eq!(resolved, "https://example.com");
     }
 }

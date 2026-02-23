@@ -401,6 +401,7 @@ pub mod eprocess {
         lambda: f64,
         mu0: f64,
         history: VecDeque<f64>,
+        eta: f64,
     }
 
     impl EProcess {
@@ -410,6 +411,7 @@ pub mod eprocess {
                 lambda: 0.5,
                 mu0: 0.0,
                 history: VecDeque::new(),
+                eta: 0.01,
             }
         }
 
@@ -419,6 +421,7 @@ pub mod eprocess {
                 lambda,
                 mu0,
                 history: VecDeque::new(),
+                eta: 0.01,
             }
         }
 
@@ -429,7 +432,17 @@ pub mod eprocess {
             if self.history.len() > 1000 {
                 self.history.pop_front();
             }
+            self.grapa_update(x);
             self.wealth
+        }
+
+        pub fn lambda(&self) -> f64 {
+            self.lambda
+        }
+
+        fn grapa_update(&mut self, x: f64) {
+            let grad = (x - self.mu0) - self.lambda;
+            self.lambda = (self.lambda + self.eta * grad).clamp(0.0, 1.0);
         }
 
         pub fn wealth(&self) -> f64 {
@@ -471,6 +484,14 @@ pub mod eprocess {
                 ep.update(10.0);
             }
             assert!(ep.alert_threshold(0.05));
+        }
+
+        #[test]
+        fn test_grapa_updates_lambda() {
+            let mut ep = EProcess::with_params(0.1, 0.0);
+            let before = ep.lambda();
+            ep.update(2.0);
+            assert!(ep.lambda() >= before);
         }
     }
 }
@@ -1737,6 +1758,423 @@ pub mod height {
     }
 }
 
+pub mod control {
+    #[derive(Debug, Clone)]
+    pub struct PidController {
+        kp: f64,
+        ki: f64,
+        kd: f64,
+        integral: f64,
+        prev_error: f64,
+        initialized: bool,
+    }
+
+    impl PidController {
+        pub fn new(kp: f64, ki: f64, kd: f64) -> Self {
+            Self {
+                kp,
+                ki,
+                kd,
+                integral: 0.0,
+                prev_error: 0.0,
+                initialized: false,
+            }
+        }
+
+        pub fn pi_default() -> Self {
+            Self::new(0.5, 0.05, 0.0)
+        }
+
+        pub fn update(&mut self, error: f64, dt: f64) -> f64 {
+            let dt_safe = dt.max(1e-6);
+            self.integral += error * dt_safe;
+            let derivative = if self.initialized {
+                (error - self.prev_error) / dt_safe
+            } else {
+                0.0
+            };
+            self.prev_error = error;
+            self.initialized = true;
+            self.kp * error + self.ki * self.integral + self.kd * derivative
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MpcEvaluator {
+        pub horizon: usize,
+        pub rho: f64,
+    }
+
+    impl MpcEvaluator {
+        pub fn new(horizon: usize, rho: f64) -> Self {
+            Self {
+                horizon: horizon.max(1),
+                rho,
+            }
+        }
+
+        pub fn objective(&self, predicted_y: &[f64], target: f64, controls: &[f64]) -> f64 {
+            let h = self.horizon.min(predicted_y.len()).min(controls.len());
+            (0..h)
+                .map(|k| {
+                    let track = (predicted_y[k] - target).powi(2);
+                    let act = self.rho * controls[k].powi(2);
+                    track + act
+                })
+                .sum()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pid_output_responds_to_error() {
+            let mut pid = PidController::new(0.5, 0.05, 0.2);
+            let out = pid.update(10.0, 0.016);
+            assert!(out > 0.0);
+        }
+
+        #[test]
+        fn mpc_objective_prefers_smaller_error() {
+            let mpc = MpcEvaluator::new(3, 0.1);
+            let low = mpc.objective(&[1.0, 1.1, 0.9], 1.0, &[0.1, 0.1, 0.1]);
+            let high = mpc.objective(&[3.0, 3.0, 3.0], 1.0, &[0.1, 0.1, 0.1]);
+            assert!(low < high);
+        }
+    }
+}
+
+pub mod sketch {
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone)]
+    pub struct CountMinSketch {
+        width: usize,
+        depth: usize,
+        table: Vec<Vec<u64>>,
+        seeds: Vec<u64>,
+    }
+
+    impl CountMinSketch {
+        pub fn new(width: usize, depth: usize) -> Self {
+            let w = width.max(1);
+            let d = depth.max(1);
+            let seeds = (0..d)
+                .map(|i| 0x9e37_79b9_7f4a_7c15u64 ^ i as u64)
+                .collect();
+            Self {
+                width: w,
+                depth: d,
+                table: vec![vec![0; w]; d],
+                seeds,
+            }
+        }
+
+        pub fn add(&mut self, key: u64, count: u64) {
+            for r in 0..self.depth {
+                let idx = self.hash(key, self.seeds[r]);
+                self.table[r][idx] = self.table[r][idx].saturating_add(count);
+            }
+        }
+
+        pub fn estimate(&self, key: u64) -> u64 {
+            (0..self.depth)
+                .map(|r| self.table[r][self.hash(key, self.seeds[r])])
+                .min()
+                .unwrap_or(0)
+        }
+
+        fn hash(&self, key: u64, seed: u64) -> usize {
+            let mut x = key ^ seed;
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51afd7ed558ccd);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+            x ^= x >> 33;
+            (x as usize) % self.width
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct WTinyLfu {
+        doorkeeper: HashSet<u64>,
+        sketch: CountMinSketch,
+    }
+
+    impl WTinyLfu {
+        pub fn new(width: usize, depth: usize) -> Self {
+            Self {
+                doorkeeper: HashSet::new(),
+                sketch: CountMinSketch::new(width, depth),
+            }
+        }
+
+        pub fn record(&mut self, key: u64) {
+            if !self.doorkeeper.insert(key) {
+                self.sketch.add(key, 1);
+            }
+        }
+
+        pub fn admit(&self, candidate: u64, victim: u64) -> bool {
+            self.sketch.estimate(candidate) >= self.sketch.estimate(victim)
+        }
+    }
+
+    pub fn pac_bayes_bound(empirical_error: f64, kl_q_p: f64, n: usize) -> f64 {
+        if n == 0 {
+            return f64::INFINITY;
+        }
+        empirical_error + (kl_q_p / (2.0 * n as f64)).sqrt()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cms_estimate_is_monotonic() {
+            let mut cms = CountMinSketch::new(128, 4);
+            cms.add(42, 1);
+            let a = cms.estimate(42);
+            cms.add(42, 2);
+            let b = cms.estimate(42);
+            assert!(b >= a);
+        }
+
+        #[test]
+        fn tiny_lfu_admission_prefers_hot_key() {
+            let mut t = WTinyLfu::new(128, 4);
+            for _ in 0..50 {
+                t.record(1);
+            }
+            t.record(2);
+            assert!(t.admit(1, 2));
+        }
+
+        #[test]
+        fn pac_bayes_shrinks_with_more_samples() {
+            let b1 = pac_bayes_bound(0.1, 1.0, 10);
+            let b2 = pac_bayes_bound(0.1, 1.0, 1000);
+            assert!(b2 < b1);
+        }
+    }
+}
+
+pub mod scheduling {
+    #[derive(Debug, Clone)]
+    pub struct Job {
+        pub weight: f64,
+        pub remaining: f64,
+        pub wait: f64,
+    }
+
+    pub fn priority(job: &Job, aging: f64) -> f64 {
+        let smith = job.weight / job.remaining.max(1e-6);
+        smith + aging * job.wait
+    }
+
+    pub fn schedule_order(mut jobs: Vec<Job>, aging: f64) -> Vec<Job> {
+        jobs.sort_by(|a, b| priority(b, aging).total_cmp(&priority(a, aging)));
+        jobs
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn aging_can_promote_waiting_job() {
+            let jobs = vec![
+                Job {
+                    weight: 1.0,
+                    remaining: 10.0,
+                    wait: 100.0,
+                },
+                Job {
+                    weight: 5.0,
+                    remaining: 2.0,
+                    wait: 1.0,
+                },
+            ];
+            let out = schedule_order(jobs, 0.1);
+            assert!(priority(&out[0], 0.1) >= priority(&out[1], 0.1));
+        }
+    }
+}
+
+pub mod visual_fx {
+    pub fn metaballs_field(x: f64, y: f64, balls: &[(f64, f64, f64)]) -> f64 {
+        balls
+            .iter()
+            .map(|(bx, by, r)| {
+                let d2 = (x - bx).powi(2) + (y - by).powi(2);
+                (r * r) / d2.max(1e-6)
+            })
+            .sum()
+    }
+
+    pub fn plasma_value(x: f64, y: f64, t: f64, phases: &[(f64, f64, f64)]) -> f64 {
+        if phases.is_empty() {
+            return 0.0;
+        }
+        let s: f64 = phases
+            .iter()
+            .map(|(kx, ky, wt)| (kx * x + ky * y + wt * t).sin())
+            .sum();
+        s / phases.len() as f64
+    }
+
+    pub fn gray_scott_step(
+        u: f64,
+        v: f64,
+        lap_u: f64,
+        lap_v: f64,
+        du: f64,
+        dv: f64,
+        feed: f64,
+        kill: f64,
+        dt: f64,
+    ) -> (f64, f64) {
+        let uvv = u * v * v;
+        let du_dt = du * lap_u - uvv + feed * (1.0 - u);
+        let dv_dt = dv * lap_v + uvv - (feed + kill) * v;
+        (u + dt * du_dt, v + dt * dv_dt)
+    }
+
+    pub fn clifford_next(x: f64, y: f64, a: f64, b: f64, c: f64, d: f64) -> (f64, f64) {
+        (
+            (a * y).sin() + c * (a * x).cos(),
+            (b * x).sin() + d * (b * y).cos(),
+        )
+    }
+
+    pub fn mandelbrot_iter(cx: f64, cy: f64, max_iter: usize) -> usize {
+        let (mut zx, mut zy) = (0.0, 0.0);
+        for i in 0..max_iter {
+            let x2 = zx * zx - zy * zy + cx;
+            let y2 = 2.0 * zx * zy + cy;
+            zx = x2;
+            zy = y2;
+            if zx * zx + zy * zy > 4.0 {
+                return i;
+            }
+        }
+        max_iter
+    }
+
+    pub fn julia_iter(zx0: f64, zy0: f64, cx: f64, cy: f64, max_iter: usize) -> usize {
+        let (mut zx, mut zy) = (zx0, zy0);
+        for i in 0..max_iter {
+            let x2 = zx * zx - zy * zy + cx;
+            let y2 = 2.0 * zx * zy + cy;
+            zx = x2;
+            zy = y2;
+            if zx * zx + zy * zy > 4.0 {
+                return i;
+            }
+        }
+        max_iter
+    }
+
+    pub fn lissajous(
+        t: f64,
+        a: f64,
+        b: f64,
+        amp_x: f64,
+        amp_y: f64,
+        delta: f64,
+        phi: f64,
+    ) -> (f64, f64) {
+        (amp_x * (a * t + delta).sin(), amp_y * (b * t + phi).sin())
+    }
+
+    pub fn flow_field_step(x: f64, y: f64, n: f64, dt: f64) -> (f64, f64) {
+        let theta = 2.0 * std::f64::consts::PI * n;
+        (x + theta.cos() * dt, y + theta.sin() * dt)
+    }
+
+    pub fn wave_interference(x: f64, t: f64, sources: &[(f64, f64, f64)]) -> f64 {
+        sources
+            .iter()
+            .map(|(k, s, w)| (k * (x - s).abs() - w * t).sin())
+            .sum()
+    }
+
+    pub fn spiral_galaxy(a: f64, b: f64, theta0: f64, omega: f64, t: f64) -> (f64, f64) {
+        let theta = theta0 + omega * t;
+        let r = a * (b * theta).exp();
+        (r * theta.cos(), r * theta.sin())
+    }
+
+    pub fn llg_step(
+        s: (f64, f64, f64),
+        h: (f64, f64, f64),
+        alpha: f64,
+        dt: f64,
+    ) -> (f64, f64, f64) {
+        let cross = cross3(s, h);
+        let double_cross = cross3(s, cross);
+        let ds = (
+            -cross.0 - alpha * double_cross.0,
+            -cross.1 - alpha * double_cross.1,
+            -cross.2 - alpha * double_cross.2,
+        );
+        (s.0 + dt * ds.0, s.1 + dt * ds.1, s.2 + dt * ds.2)
+    }
+
+    fn cross3(a: (f64, f64, f64), b: (f64, f64, f64)) -> (f64, f64, f64) {
+        (
+            a.1 * b.2 - a.2 * b.1,
+            a.2 * b.0 - a.0 * b.2,
+            a.0 * b.1 - a.1 * b.0,
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn metaballs_stronger_near_center() {
+            let balls = vec![(0.0, 0.0, 2.0)];
+            assert!(metaballs_field(0.1, 0.1, &balls) > metaballs_field(5.0, 5.0, &balls));
+        }
+
+        #[test]
+        fn fractal_escape_counts_valid() {
+            let m = mandelbrot_iter(0.0, 0.0, 64);
+            let j = julia_iter(0.0, 0.0, -0.8, 0.156, 64);
+            assert!(m <= 64);
+            assert!(j <= 64);
+        }
+
+        #[test]
+        fn flow_field_step_moves_particle() {
+            let (x1, y1) = flow_field_step(0.0, 0.0, 0.25, 1.0);
+            assert!(x1.is_finite());
+            assert!(y1.is_finite());
+            assert!((x1 != 0.0) || (y1 != 0.0));
+        }
+
+        #[test]
+        fn spiral_radius_grows_with_theta() {
+            let p1 = spiral_galaxy(1.0, 0.2, 0.0, 1.0, 0.1);
+            let p2 = spiral_galaxy(1.0, 0.2, 0.0, 1.0, 2.0);
+            let r1 = (p1.0 * p1.0 + p1.1 * p1.1).sqrt();
+            let r2 = (p2.0 * p2.0 + p2.1 * p2.1).sqrt();
+            assert!(r2 > r1);
+        }
+
+        #[test]
+        fn llg_step_is_finite() {
+            let s1 = llg_step((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.1, 0.01);
+            assert!(s1.0.is_finite() && s1.1.is_finite() && s1.2.is_finite());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,6 +2197,19 @@ mod tests {
         let _ = pulses::half_sine_pulse(0.5);
         let _ = stagger::stagger_offsets(3, 1.0, animation::Easing::Linear, 0.0, 1);
         let _ = height::BayesianHeightPredictor::new(20.0, 10.0, 1.0, 0.1);
+        let _ = control::PidController::pi_default();
+        let _ = control::MpcEvaluator::new(8, 0.1);
+        let _ = sketch::CountMinSketch::new(32, 4);
+        let _ = sketch::WTinyLfu::new(32, 4);
+        let _ = scheduling::schedule_order(
+            vec![scheduling::Job {
+                weight: 1.0,
+                remaining: 1.0,
+                wait: 0.0,
+            }],
+            0.1,
+        );
+        let _ = visual_fx::metaballs_field(0.0, 0.0, &[(0.0, 0.0, 1.0)]);
     }
 
     #[test]

@@ -10,6 +10,7 @@ default = []
 syntax-highlighting = []
 
 [dependencies]
+chromatui-algorithms = { path = "../chromatui-algorithms" }
 chromatui-core = { path = "../chromatui-core" }
 chromatui-render = { path = "../chromatui-render" }
 chromatui-widgets = { path = "../chromatui-widgets" }

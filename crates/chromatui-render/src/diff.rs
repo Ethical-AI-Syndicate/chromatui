@@ -32,6 +32,7 @@ impl Region {
 #[derive(Debug, Clone)]
 pub struct Content {
     pub lines: Vec<String>,
+    pub links: Vec<Vec<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,11 +55,22 @@ pub struct BufferDiff {
 
 impl Content {
     pub fn new() -> Self {
-        Self { lines: Vec::new() }
+        Self {
+            lines: Vec::new(),
+            links: Vec::new(),
+        }
     }
 
     pub fn from_lines(lines: Vec<String>) -> Self {
-        Self { lines }
+        let links = lines
+            .iter()
+            .map(|line| vec![None; line.len()])
+            .collect::<Vec<_>>();
+        Self { lines, links }
+    }
+
+    pub fn from_lines_with_links(lines: Vec<String>, links: Vec<Vec<Option<String>>>) -> Self {
+        Self { lines, links }
     }
 }
 
@@ -101,7 +113,9 @@ impl DiffRenderer {
         }
 
         let prev_lines = &prev.unwrap().lines;
+        let prev_links_all = &prev.unwrap().links;
         let new_lines = &new_content.lines;
+        let new_links_all = &new_content.links;
 
         let mut regions = Vec::new();
         let max_rows = std::cmp::max(prev_lines.len(), new_lines.len());
@@ -110,7 +124,9 @@ impl DiffRenderer {
             let prev_line = prev_lines.get(row);
             let new_line = new_lines.get(row);
 
-            if prev_line != new_line {
+            let prev_links = prev_links_all.get(row);
+            let new_links = new_links_all.get(row);
+            if prev_line != new_line || prev_links != new_links {
                 regions.push(Region::new(
                     row as u16,
                     0,

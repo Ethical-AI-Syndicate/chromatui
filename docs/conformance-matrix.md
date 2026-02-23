@@ -78,3 +78,28 @@ Observed evidence (terminal trace capture):
 Evidence source:
 
 - `crates/chromatui-runtime/examples/visual_validation.rs`
+
+## 5) Benchmark and Proof Evidence
+
+Validation commands run:
+
+- `cargo bench -p chromatui-render --no-run`
+- `cargo bench -p chromatui-render --bench diff_bench -- --sample-size 10`
+
+Observed benchmark evidence:
+
+- `diff/identical_100x50   time: [179.05 us 181.27 us 183.00 us]`
+- `diff/sparse_5pct_100x50 time: [242.69 us 247.55 us 255.01 us]`
+- `diff/dense_100x50       time: [233.12 us 245.82 us 253.44 us]`
+
+Proof-oriented and deterministic validation additions:
+
+- `crates/chromatui-render/src/no_flicker_proof.rs` includes randomized theorem checks for diff completeness.
+- `crates/chromatui-core/src/runtime.rs` includes 16-byte packed-cell compile-time size assertion (`PackedCell16`).
+- `crates/chromatui-render/src/presenter.rs` includes OSC-8 hyperlink encoding tests for linked runs.
+
+Additional subsystem evidence:
+
+- Modal stack + time-travel recorder: `crates/chromatui-widgets/src/lib.rs`
+- Synchronized output brackets (DEC 2026): `crates/chromatui-core/src/backend.rs`
+- PID/PI, MPC objective, Count-Min, W-TinyLFU, PAC-Bayes, scheduling math, and expanded FX equations: `crates/chromatui-algorithms/src/lib.rs`

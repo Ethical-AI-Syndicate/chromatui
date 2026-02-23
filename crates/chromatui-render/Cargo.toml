@@ -8,3 +8,10 @@ license.workspace = true
 [dependencies]
 chromatui-core = { path = "../chromatui-core" }
 chromatui-layout = { path = "../chromatui-layout" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "diff_bench"
+harness = false
