@@ -520,6 +520,10 @@ impl List {
     }
 
     pub fn move_selection(&mut self, direction: FocusDirection) {
+        if self.items.is_empty() {
+            return;
+        }
+
         let new_idx = match direction {
             FocusDirection::Up | FocusDirection::Previous => {
                 if self.focused_index > 0 {
@@ -1025,5 +1029,13 @@ mod tests {
         assert_eq!(tt.current(), Some("frame-c"));
         assert!(tt.seek(0));
         assert_eq!(tt.current(), Some("frame-a"));
+    }
+
+    #[test]
+    fn list_move_selection_is_safe_when_empty() {
+        let mut list = List::new(WidgetId::new(99));
+        list.move_selection(FocusDirection::Up);
+        list.move_selection(FocusDirection::Down);
+        assert_eq!(list.focused_index, 0);
     }
 }

@@ -686,7 +686,7 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         V: Fn(&M) -> Frame,
     {
         let mut steps = 0usize;
-        let timeout_ms = timeout.as_millis() as u64;
+        let timeout_ms = timeout.as_millis().max(1) as u64;
         let mut now_ms = 0u64;
         while self.running && steps < max_steps {
             let mut event = self
@@ -741,7 +741,11 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
                         self.run_cmd(Some(effect));
                     }
                 }
-                Effect::Subscribe(sub) => self.subscriptions.push(sub),
+                Effect::Subscribe(sub) => {
+                    if !self.subscriptions.iter().any(|s| s.kind == sub.kind) {
+                        self.subscriptions.push(sub);
+                    }
+                }
                 Effect::Timeout(_, _) => {}
             }
         }
@@ -754,7 +758,7 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
     fn next_subscription_event(&mut self, now_ms: u64) -> Option<Event> {
         for (idx, sub) in self.subscriptions.iter().enumerate() {
             if let SubscriptionKind::Tick(interval) = &sub.kind {
-                let interval_ms = interval.as_millis() as u64;
+                let interval_ms = interval.as_millis().max(1) as u64;
                 let last = self
                     .subscription_last_fire_ms
                     .get(&idx)
@@ -895,6 +899,23 @@ mod tests {
         let rendered = String::from_utf8(bytes).expect("output should be valid UTF-8");
         assert!(rendered.contains("\r"));
         assert!(rendered.contains("1"));
+    }
+
+    #[test]
+    fn duplicate_subscriptions_are_deduplicated() {
+        let _guard = writer_test_lock()
+            .lock()
+            .expect("writer test lock should not be poisoned");
+        let writer = TerminalWriter::try_new(Vec::<u8>::new(), OutputMode::Inline)
+            .expect("writer should be created");
+        let mut rt = DeterministicRuntime::new(LoopModel::default(), writer, 6, 1);
+
+        rt.step(Event::Key(Key::Char('s')), view)
+            .expect("first subscribe should succeed");
+        rt.step(Event::Key(Key::Char('s')), view)
+            .expect("duplicate subscribe should succeed");
+
+        assert_eq!(rt.subscriptions_len(), 1);
     }
 
     #[test]

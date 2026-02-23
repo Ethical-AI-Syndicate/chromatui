@@ -32,7 +32,12 @@ impl Default for StdoutBackend {
 
 impl TerminalBackend for StdoutBackend {
     fn read_event(&mut self) -> Option<Event> {
-        None
+        match crossterm::event::read().ok()? {
+            crossterm::event::Event::Key(key) => key_to_event_backend(key),
+            crossterm::event::Event::Mouse(mouse) => Some(mouse_to_event_backend(mouse)),
+            crossterm::event::Event::Resize(cols, rows) => Some(Event::Resize(cols, rows)),
+            _ => None,
+        }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -40,11 +45,15 @@ impl TerminalBackend for StdoutBackend {
     }
 
     fn get_size(&self) -> (u16, u16) {
-        self.size
+        crossterm::terminal::size().unwrap_or(self.size)
     }
 
-    fn set_raw_mode(&mut self, _enabled: bool) -> std::io::Result<()> {
-        Ok(())
+    fn set_raw_mode(&mut self, enabled: bool) -> std::io::Result<()> {
+        if enabled {
+            crossterm::terminal::enable_raw_mode()
+        } else {
+            crossterm::terminal::disable_raw_mode()
+        }
     }
 }
 
@@ -76,21 +85,34 @@ impl TerminalSession {
     }
 
     pub fn start(&self) -> std::io::Result<()> {
+        use crossterm::cursor::Hide;
         use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 
+        if self.is_running() {
+            return Ok(());
+        }
+
         enable_raw_mode()?;
-        crossterm::execute!(stdout(), EnterAlternateScreen {})?;
+        if let Err(err) = crossterm::execute!(stdout(), EnterAlternateScreen {}, Hide) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(err);
+        }
 
         self.set_running(true);
         Ok(())
     }
 
     pub fn stop(&self) -> std::io::Result<()> {
+        use crossterm::cursor::Show;
         use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+
+        if !self.is_running() {
+            return Ok(());
+        }
 
         self.set_running(false);
 
-        crossterm::execute!(stdout(), LeaveAlternateScreen {})?;
+        crossterm::execute!(stdout(), Show, LeaveAlternateScreen {})?;
         disable_raw_mode()?;
 
         Ok(())
@@ -106,69 +128,76 @@ impl TerminalSession {
 
     pub fn read_event(&self) -> Option<Event> {
         match crossterm::event::read().ok()? {
-            crossterm::event::Event::Key(key) => Some(self.key_to_event(key)),
+            crossterm::event::Event::Key(key) => self.key_to_event(key),
             crossterm::event::Event::Mouse(mouse) => Some(self.mouse_to_event(mouse)),
             crossterm::event::Event::Resize(cols, rows) => Some(Event::Resize(cols, rows)),
             _ => None,
         }
     }
 
-    fn key_to_event(&self, key: crossterm::event::KeyEvent) -> Event {
+    fn key_to_event(&self, key: crossterm::event::KeyEvent) -> Option<Event> {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        if matches!(key.kind, KeyEventKind::Release) {
+            return None;
+        }
+
         let code = key.code;
 
-        if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-            if let crossterm::event::KeyCode::Char(c) = code {
-                return Event::Key(Key::Alt(c));
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c) = code {
+                return Some(Event::Key(Key::Alt(c)));
             }
         }
 
-        if key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL)
-        {
-            if let crossterm::event::KeyCode::Char(c) = code {
-                return Event::Key(Key::Ctrl(c));
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c) = code {
+                return Some(Event::Key(Key::Ctrl(c)));
             }
         }
 
-        match code {
-            crossterm::event::KeyCode::Char(c) => Event::Key(Key::Char(c)),
-            crossterm::event::KeyCode::Enter => Event::Key(Key::Enter),
-            crossterm::event::KeyCode::Backspace => Event::Key(Key::Backspace),
-            crossterm::event::KeyCode::Delete => Event::Key(Key::Delete),
-            crossterm::event::KeyCode::Up => Event::Key(Key::Up),
-            crossterm::event::KeyCode::Down => Event::Key(Key::Down),
-            crossterm::event::KeyCode::Left => Event::Key(Key::Left),
-            crossterm::event::KeyCode::Right => Event::Key(Key::Right),
-            crossterm::event::KeyCode::Home => Event::Key(Key::Home),
-            crossterm::event::KeyCode::End => Event::Key(Key::End),
-            crossterm::event::KeyCode::PageUp => Event::Key(Key::PageUp),
-            crossterm::event::KeyCode::PageDown => Event::Key(Key::PageDown),
-            crossterm::event::KeyCode::Tab => Event::Key(Key::Tab),
-            crossterm::event::KeyCode::Esc => Event::Key(Key::Escape),
-            crossterm::event::KeyCode::F(n) => Event::Key(Key::F(n)),
-            _ => Event::Key(Key::Escape),
-        }
+        let mapped = match code {
+            KeyCode::Char(c) => Key::Char(c),
+            KeyCode::Enter => Key::Enter,
+            KeyCode::Backspace => Key::Backspace,
+            KeyCode::Delete => Key::Delete,
+            KeyCode::Up => Key::Up,
+            KeyCode::Down => Key::Down,
+            KeyCode::Left => Key::Left,
+            KeyCode::Right => Key::Right,
+            KeyCode::Home => Key::Home,
+            KeyCode::End => Key::End,
+            KeyCode::PageUp => Key::PageUp,
+            KeyCode::PageDown => Key::PageDown,
+            KeyCode::Tab | KeyCode::BackTab => Key::Tab,
+            KeyCode::Esc => Key::Escape,
+            KeyCode::F(n) => Key::F(n),
+            _ => return None,
+        };
+
+        Some(Event::Key(mapped))
     }
 
     fn mouse_to_event(&self, mouse: crossterm::event::MouseEvent) -> Event {
+        use crossterm::event::MouseEventKind;
+
         let button = match mouse.kind {
-            crossterm::event::MouseEventKind::Down(b) => match b {
-                crossterm::event::MouseButton::Left => MouseButton::Left,
-                crossterm::event::MouseButton::Middle => MouseButton::Middle,
-                crossterm::event::MouseButton::Right => MouseButton::Right,
-            },
-            crossterm::event::MouseEventKind::Up(_) => MouseButton::Left,
-            crossterm::event::MouseEventKind::Drag(_) => MouseButton::Left,
-            crossterm::event::MouseEventKind::Moved => MouseButton::Left,
+            MouseEventKind::Down(b) | MouseEventKind::Up(b) | MouseEventKind::Drag(b) => {
+                map_mouse_button(b)
+            }
+            MouseEventKind::ScrollUp => MouseButton::ScrollUp,
+            MouseEventKind::ScrollDown => MouseButton::ScrollDown,
+            MouseEventKind::Moved => MouseButton::Left,
             _ => MouseButton::Left,
         };
 
         let event_type = match mouse.kind {
-            crossterm::event::MouseEventKind::Down(_) => MouseEventType::Press,
-            crossterm::event::MouseEventKind::Up(_) => MouseEventType::Release,
-            crossterm::event::MouseEventKind::Drag(_) => MouseEventType::Drag,
-            crossterm::event::MouseEventKind::Moved => MouseEventType::Hover,
+            MouseEventKind::Down(_) => MouseEventType::Press,
+            MouseEventKind::Up(_) => MouseEventType::Release,
+            MouseEventKind::Drag(_) => MouseEventType::Drag,
+            MouseEventKind::Moved | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                MouseEventType::Hover
+            }
             _ => MouseEventType::Hover,
         };
 
@@ -232,6 +261,24 @@ impl TerminalSession {
     }
 }
 
+fn map_mouse_button(button: crossterm::event::MouseButton) -> MouseButton {
+    match button {
+        crossterm::event::MouseButton::Left => MouseButton::Left,
+        crossterm::event::MouseButton::Middle => MouseButton::Middle,
+        crossterm::event::MouseButton::Right => MouseButton::Right,
+    }
+}
+
+fn key_to_event_backend(key: crossterm::event::KeyEvent) -> Option<Event> {
+    let session = TerminalSession::new();
+    session.key_to_event(key)
+}
+
+fn mouse_to_event_backend(mouse: crossterm::event::MouseEvent) -> Event {
+    let session = TerminalSession::new();
+    session.mouse_to_event(mouse)
+}
+
 fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
     match idx {
         0 => (0, 0, 0),
@@ -266,6 +313,7 @@ impl Default for TerminalSession {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     #[test]
     fn capability_probe_returns_probability_bounds() {
@@ -273,6 +321,41 @@ mod capability_tests {
         let caps = session.probe_capabilities();
         assert!((0.0..=1.0).contains(&caps.alt_screen_probability));
         assert!((0.0..=1.0).contains(&caps.truecolor_probability));
+    }
+
+    #[test]
+    fn unknown_key_code_is_not_mapped_to_escape() {
+        let session = TerminalSession::new();
+        let key = KeyEvent {
+            code: KeyCode::Null,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+
+        assert!(session.key_to_event(key).is_none());
+    }
+
+    #[test]
+    fn scroll_events_map_to_scroll_buttons() {
+        let session = TerminalSession::new();
+        let scroll_up = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        let event = session.mouse_to_event(scroll_up);
+        assert_eq!(
+            event,
+            Event::Mouse(MouseEvent {
+                event_type: MouseEventType::Hover,
+                button: MouseButton::ScrollUp,
+                row: 4,
+                col: 10,
+            })
+        );
     }
 }
 

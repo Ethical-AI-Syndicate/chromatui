@@ -1,6 +1,9 @@
+use std::io::Write;
 use std::mem::size_of;
 use std::time::Duration;
+use std::time::Instant;
 
+use crate::backend::TerminalSession;
 use crate::types::Event;
 
 pub trait Model: Sized + Default {
@@ -50,6 +53,7 @@ pub struct Subscription<M: Model> {
     _phantom: std::marker::PhantomData<M>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionKind {
     Tick(Duration),
     Resize,
@@ -90,6 +94,9 @@ impl<M: Model> Subscription<M> {
 pub struct Program<M: Model> {
     model: M,
     subscriptions: Vec<Subscription<M>>,
+    timers: Vec<(Instant, Event)>,
+    last_tick_fired: Option<Instant>,
+    session: TerminalSession,
     running: bool,
 }
 
@@ -98,6 +105,9 @@ impl<M: Model> Program<M> {
         Self {
             model: M::default(),
             subscriptions: Vec::new(),
+            timers: Vec::new(),
+            last_tick_fired: None,
+            session: TerminalSession::new(),
             running: false,
         }
     }
@@ -106,6 +116,9 @@ impl<M: Model> Program<M> {
         Self {
             model,
             subscriptions: Vec::new(),
+            timers: Vec::new(),
+            last_tick_fired: None,
+            session: TerminalSession::new(),
             running: false,
         }
     }
@@ -126,22 +139,85 @@ impl<M: Model> Program<M> {
     where
         F: Fn(&M) -> Frame,
     {
+        self.session.start()?;
         self.running = true;
 
-        while self.running {
-            let event = self.poll_event(Duration::from_millis(16))?;
+        let result = (|| {
+            while self.running {
+                let event = self.poll_event(Duration::from_millis(16))?;
 
-            let cmd = self.model.update(event);
-            self.run_cmd(cmd);
+                let cmd = self.model.update(event);
+                self.run_cmd(cmd);
 
-            let frame = view(&self.model);
-            self.render(frame);
-        }
+                let frame = view(&self.model);
+                self.render(frame)?;
+            }
 
-        Ok(())
+            Ok(())
+        })();
+
+        let stop_result = self.session.stop();
+        result.and(stop_result)
     }
 
-    fn poll_event(&mut self, _timeout: Duration) -> std::io::Result<Event> {
+    fn poll_event(&mut self, timeout: Duration) -> std::io::Result<Event> {
+        let now = Instant::now();
+
+        if let Some(idx) = self.timers.iter().position(|(at, _)| *at <= now) {
+            let (_, event) = self.timers.remove(idx);
+            return Ok(event);
+        }
+
+        let next_tick_due = self
+            .subscriptions
+            .iter()
+            .filter_map(|s| match s.kind {
+                SubscriptionKind::Tick(interval) => Some(interval),
+                _ => None,
+            })
+            .min();
+
+        let tick_wait = if let Some(interval) = next_tick_due {
+            let last = self
+                .last_tick_fired
+                .unwrap_or_else(|| now.checked_sub(interval).unwrap_or(now));
+            let due = last.checked_add(interval).unwrap_or(now);
+            due.saturating_duration_since(now)
+        } else {
+            timeout
+        };
+
+        let timer_wait = self
+            .timers
+            .iter()
+            .map(|(at, _)| at.saturating_duration_since(now))
+            .min()
+            .unwrap_or(timeout);
+
+        let wait = timeout.min(tick_wait).min(timer_wait);
+
+        if let Some(event) = self.session.poll_event(wait) {
+            return Ok(event);
+        }
+
+        let now_after_poll = Instant::now();
+        if let Some(idx) = self.timers.iter().position(|(at, _)| *at <= now_after_poll) {
+            let (_, event) = self.timers.remove(idx);
+            return Ok(event);
+        }
+
+        if let Some(interval) = next_tick_due {
+            let last = self.last_tick_fired.unwrap_or_else(|| {
+                now_after_poll
+                    .checked_sub(interval)
+                    .unwrap_or(now_after_poll)
+            });
+            if now_after_poll.saturating_duration_since(last) >= interval {
+                self.last_tick_fired = Some(now_after_poll);
+                return Ok(Event::Tick);
+            }
+        }
+
         Ok(Event::Tick)
     }
 
@@ -158,14 +234,34 @@ impl<M: Model> Program<M> {
                     }
                 }
                 Effect::Subscribe(sub) => {
-                    self.subscriptions.push(sub);
+                    if !self.subscriptions.iter().any(|s| s.kind == sub.kind) {
+                        self.subscriptions.push(sub);
+                    }
                 }
-                Effect::Timeout(_, _) => {}
+                Effect::Timeout(delay, event) => {
+                    let at = Instant::now()
+                        .checked_add(delay)
+                        .unwrap_or_else(Instant::now);
+                    self.timers.push((at, event));
+                }
             }
         }
     }
 
-    fn render(&self, _frame: Frame) {}
+    fn render(&self, frame: Frame) -> std::io::Result<()> {
+        let mut out = std::io::stdout();
+        for row in 0..frame.height {
+            out.write_all(format!("\x1b[{};1H", row + 1).as_bytes())?;
+            for col in 0..frame.width {
+                let idx = row as usize * frame.width as usize + col as usize;
+                let ch = frame.cells.get(idx).map(|c| c.ch).unwrap_or(' ');
+                let c = if ch == '\0' { ' ' } else { ch };
+                let mut buf = [0u8; 4];
+                out.write_all(c.encode_utf8(&mut buf).as_bytes())?;
+            }
+        }
+        out.flush()
+    }
 }
 
 impl<M: Model> Default for Program<M> {
@@ -456,5 +552,19 @@ mod tests {
             .get(id)
             .expect("link id should resolve");
         assert_eq!(resolved, "https://example.com");
+    }
+
+    #[test]
+    fn timeout_effect_schedules_timer_event() {
+        let mut program: Program<TestModel> = Program::new();
+        program.run_cmd(Some(Effect::timeout(
+            Duration::from_millis(0),
+            Event::Timer(7),
+        )));
+
+        let event = program
+            .poll_event(Duration::from_millis(0))
+            .expect("poll_event should produce timer event");
+        assert_eq!(event, Event::Timer(7));
     }
 }
