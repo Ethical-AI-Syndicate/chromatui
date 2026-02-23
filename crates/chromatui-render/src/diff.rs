@@ -78,6 +78,7 @@ impl DiffRenderer {
             self.dirty_regions.clear();
             self.dirty_regions
                 .push(Region::new(0, 0, self.height, self.width));
+            self.prev_content = Some(new_content.clone());
             return self.dirty_regions.clone();
         }
 

@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 chromatui-core = { path = "../chromatui-core" }
+chromatui-render = { path = "../chromatui-render" }

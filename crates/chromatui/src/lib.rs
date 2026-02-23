@@ -1,10 +1,14 @@
 pub use chromatui_core::{
-    AnsiParser, Event, Key, MouseButton, MouseEvent, MouseEventType, StdoutBackend, TerminalBackend,
+    AnsiParser, Event, Key, MouseButton, MouseEvent, MouseEventType, OutputMode, StdoutBackend,
+    TerminalBackend, TerminalWriter,
 };
 
-pub use chromatui_render::{Content, DiffRenderer, Line, Region, Viewport};
+pub use chromatui_render::{AnsiPresenter, Content, DiffRenderer, Line, Region, Viewport};
 
-pub use chromatui_runtime::{InlineContext, Runtime, RuntimeState, Timer};
+pub use chromatui_runtime::{
+    frame_to_content, DeterministicRuntime, FramePipeline, InlineContext, Runtime, RuntimeState,
+    Timer,
+};
 
 pub use chromatui_layout as layout;
 pub use chromatui_style as style;
