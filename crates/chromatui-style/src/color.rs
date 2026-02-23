@@ -39,9 +39,9 @@ impl Color {
             return gray;
         }
 
-        let r = (self.r / 51) as u8;
-        let g = (self.g / 51) as u8;
-        let b = (self.b / 51) as u8;
+        let r = self.r / 51;
+        let g = self.g / 51;
+        let b = self.b / 51;
 
         16 + r * 36 + g * 6 + b
     }

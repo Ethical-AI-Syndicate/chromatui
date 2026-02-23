@@ -133,7 +133,7 @@ impl GridLayout {
         }
 
         let mut rects = Vec::new();
-        for (_node_id, node) in &self.nodes {
+        for node in self.nodes.values() {
             if let Ok(layout) = self.tree.layout(*node) {
                 rects.push(LayoutRect {
                     x: layout.location.x as i32,

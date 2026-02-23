@@ -114,12 +114,12 @@ impl SnapshotTester {
                 let mut current_content = String::new();
 
                 for line in data.lines() {
-                    if line.starts_with("# ") {
+                    if let Some(stripped) = line.strip_prefix("# ") {
                         if !current_name.is_empty() {
                             self.snapshots
                                 .insert(current_name.clone(), Snapshot::new(&current_content));
                         }
-                        current_name = line[2..].to_string();
+                        current_name = stripped.to_string();
                         current_content.clear();
                     } else {
                         current_content.push_str(line);
@@ -164,7 +164,7 @@ pub struct SnapshotDiff {
 
 impl fmt::Display for SnapshotDiff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Snapshot '{}' mismatch:\n", self.name)?;
+        writeln!(f, "Snapshot '{}' mismatch:", self.name)?;
         write!(f, "Expected:\n{}\n", self.expected)?;
         write!(f, "Actual:\n{}\n", self.actual)
     }

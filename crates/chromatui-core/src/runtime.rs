@@ -8,7 +8,9 @@ pub trait Model: Sized + Default {
 
 pub type Cmd<M> = Option<Effect<M>>;
 
+#[derive(Default)]
 pub enum Effect<M: Model> {
+    #[default]
     None,
     Quit,
     Batch(Vec<Effect<M>>),
@@ -39,12 +41,6 @@ impl<M: Model> Effect<M> {
 
     pub fn timeout(delay: Duration, event: Event) -> Self {
         Effect::Timeout(delay, event)
-    }
-}
-
-impl<M: Model> Default for Effect<M> {
-    fn default() -> Self {
-        Effect::None
     }
 }
 

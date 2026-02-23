@@ -20,6 +20,12 @@ impl StdoutBackend {
     }
 }
 
+impl Default for StdoutBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TerminalBackend for StdoutBackend {
     fn read_event(&mut self) -> Option<Event> {
         None
@@ -163,9 +169,7 @@ impl TerminalSession {
     }
 
     pub fn get_size(&self) -> (u16, u16) {
-        crossterm::terminal::size()
-            .map(|(c, r)| (c, r))
-            .unwrap_or((80, 24))
+        crossterm::terminal::size().unwrap_or((80, 24))
     }
 }
 

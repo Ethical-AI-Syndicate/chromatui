@@ -85,18 +85,13 @@ pub enum JustifyContent {
     SpaceAround,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum AlignItems {
+    #[default]
     Stretch,
     Start,
     End,
     Center,
-}
-
-impl Default for AlignItems {
-    fn default() -> Self {
-        AlignItems::Stretch
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

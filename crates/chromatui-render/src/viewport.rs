@@ -56,6 +56,10 @@ impl Viewport {
         self.buffer.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     pub fn scroll_offset(&self) -> u32 {
         self.scroll_offset
     }

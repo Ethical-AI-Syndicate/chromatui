@@ -553,6 +553,10 @@ pub mod fenwick {
         pub fn len(&self) -> usize {
             self.n
         }
+
+        pub fn is_empty(&self) -> bool {
+            self.n == 0
+        }
     }
 
     #[cfg(test)]
@@ -770,17 +774,14 @@ pub mod diff {
 
         pub fn mark_dirty(&mut self, row: usize, col: usize) {
             self.dirty_rows.insert(row);
-            self.row_spans
-                .entry(row)
-                .or_insert_with(Vec::new)
-                .push((col, col + 1));
+            self.row_spans.entry(row).or_default().push((col, col + 1));
         }
 
         pub fn mark_dirty_range(&mut self, row: usize, start_col: usize, end_col: usize) {
             self.dirty_rows.insert(row);
             self.row_spans
                 .entry(row)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((start_col, end_col));
         }
 
