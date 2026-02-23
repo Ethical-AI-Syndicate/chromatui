@@ -124,6 +124,14 @@ Then build your model loop around `Event -> update -> view` and render through t
 - `docs/plans/2026-02-22-kernel-tui-foundation-design.md`: foundation design plan
 - `docs/plans/2026-02-22-kernel-tui-foundation.md`: implementation plan
 
+## Community and Project Health
+
+- Contributing guide: `CONTRIBUTING.md`
+- Code of conduct: `CODE_OF_CONDUCT.md`
+- Security policy: `SECURITY.md`
+- Support channels: `SUPPORT.md`
+- Changelog: `CHANGELOG.md`
+
 ## License
 
 MIT License with OpenAI/Anthropic rider.
