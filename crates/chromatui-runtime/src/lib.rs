@@ -219,6 +219,20 @@ pub struct ResizeLedgerEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct FrameEvidence {
+    pub step_index: usize,
+    pub event: Event,
+    pub strategy: DiffStrategy,
+    pub bytes_emitted: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeEvidenceReport {
+    pub frames: Vec<FrameEvidence>,
+    pub resize_ledger: Vec<ResizeLedgerEntry>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResizeCoalescer {
     detector: RegimeDetector,
     last_resize_ms: Option<u64>,
@@ -326,6 +340,8 @@ pub struct DeterministicRuntime<M: Model, W: Write> {
     writer: TerminalWriter<W>,
     subscriptions: Vec<Subscription<M>>,
     resize_coalescer: ResizeCoalescer,
+    evidence: RuntimeEvidenceReport,
+    step_counter: usize,
     running: bool,
 }
 
@@ -337,6 +353,8 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             writer,
             subscriptions: Vec::new(),
             resize_coalescer: ResizeCoalescer::new(),
+            evidence: RuntimeEvidenceReport::default(),
+            step_counter: 0,
             running: true,
         }
     }
@@ -369,6 +387,15 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         self.resize_coalescer.last_entry().map(|e| e.lbf)
     }
 
+    pub fn evidence_report(&self) -> RuntimeEvidenceReport {
+        self.evidence.clone()
+    }
+
+    pub fn clear_evidence(&mut self) {
+        self.evidence = RuntimeEvidenceReport::default();
+        self.step_counter = 0;
+    }
+
     pub fn step<V>(&mut self, event: Event, view: V) -> std::io::Result<()>
     where
         V: Fn(&M) -> Frame,
@@ -376,6 +403,8 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         if !self.running {
             return Ok(());
         }
+
+        let observed_event = event.clone();
 
         if let Event::Resize(width, height) = event {
             self.pipeline.update_size(width, height);
@@ -386,7 +415,18 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
 
         let frame = view(&self.model);
         let ansi = self.pipeline.render_frame(&frame);
-        self.writer.write_frame(&ansi)
+        let strategy = self.pipeline.last_strategy();
+        self.writer.write_frame(&ansi)?;
+
+        self.step_counter = self.step_counter.saturating_add(1);
+        self.evidence.frames.push(FrameEvidence {
+            step_index: self.step_counter,
+            event: observed_event,
+            strategy,
+            bytes_emitted: ansi.len(),
+        });
+
+        Ok(())
     }
 
     pub fn run_with_source<E, V>(
@@ -418,8 +458,14 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
 
             if let Event::Resize(w, h) = event {
                 if !self.resize_coalescer.observe_resize_at(w, h, now_ms) {
+                    if let Some(entry) = self.resize_coalescer.last_entry() {
+                        self.evidence.resize_ledger.push(entry.clone());
+                    }
                     now_ms = now_ms.saturating_add(timeout_ms);
                     continue;
+                }
+                if let Some(entry) = self.resize_coalescer.last_entry() {
+                    self.evidence.resize_ledger.push(entry.clone());
                 }
                 event = Event::Resize(w, h);
             }
@@ -605,5 +651,27 @@ mod tests {
             .last_entry()
             .expect("resize coalescer should record entries");
         assert!(last.lbf < 0.0);
+    }
+
+    #[test]
+    fn evidence_report_contains_frame_and_resize_entries() {
+        let writer = TerminalWriter::try_new(Vec::<u8>::new(), OutputMode::Inline)
+            .expect("writer should be created");
+        let mut rt = DeterministicRuntime::new(LoopModel::default(), writer, 6, 1);
+        let mut source = VecEventSource::new(vec![
+            Event::Resize(6, 1),
+            Event::Resize(6, 1),
+            Event::Tick,
+            Event::Key(Key::Char('q')),
+        ]);
+
+        let _ = rt
+            .run_with_source(&mut source, Duration::from_millis(20), 20, view)
+            .expect("runtime loop should succeed");
+
+        let report = rt.evidence_report();
+        assert!(!report.frames.is_empty());
+        assert!(!report.resize_ledger.is_empty());
+        assert!(report.frames.iter().all(|f| f.step_index > 0));
     }
 }
