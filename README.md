@@ -65,4 +65,9 @@ fn main() {
 
 ## License
 
-MIT OR Apache-2.0
+MIT License, with OpenAI/Anthropic rider.
+
+- Primary license: `LICENSE`
+- Rider: `LICENSE-OPENAI-ANTHROPIC-RIDER.md`
+
+Copyright (c) 2026 Mike Holownych
