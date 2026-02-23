@@ -1,6 +1,30 @@
-[package]
-name = "chromatui"
+[workspace]
+members = [
+    "crates/chromatui",
+    "crates/chromatui-core",
+    "crates/chromatui-render",
+    "crates/chromatui-style",
+    "crates/chromatui-text",
+    "crates/chromatui-layout",
+    "crates/chromatui-runtime",
+    "crates/chromatui-widgets",
+    "crates/chromatui-extras",
+    "crates/chromatui-harness",
+    "crates/chromatui-pty",
+    "crates/chromatui-simd",
+]
+
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["ChromatUI Team"]
+license = "MIT OR Apache-2.0"
 
-[dependencies]
+[workspace.dependencies]
+ansi-parser = "0.2"
+crossterm = "0.28"
+portable-pty = "0.8"
+simd-json = "0.14"
+tempfile = "3"

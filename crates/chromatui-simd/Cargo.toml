@@ -1,0 +1,12 @@
+[package]
+name = "chromatui-simd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+simd-json.workspace = true

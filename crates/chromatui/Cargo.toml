@@ -1,0 +1,20 @@
+[package]
+name = "chromatui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chromatui-core = { path = "../chromatui-core" }
+chromatui-render = { path = "../chromatui-render" }
+chromatui-style = { path = "../chromatui-style" }
+chromatui-text = { path = "../chromatui-text" }
+chromatui-layout = { path = "../chromatui-layout" }
+chromatui-runtime = { path = "../chromatui-runtime" }
+chromatui-widgets = { path = "../chromatui-widgets" }
+chromatui-extras = { path = "../chromatui-extras", optional = true }
+
+[features]
+default = ["extras"]
+extras = ["dep:chromatui-extras"]

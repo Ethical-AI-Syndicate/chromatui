@@ -1,0 +1,12 @@
+[package]
+name = "chromatui-widgets"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chromatui-core = { path = "../chromatui-core" }
+chromatui-render = { path = "../chromatui-render" }
+chromatui-style = { path = "../chromatui-style" }
+chromatui-text = { path = "../chromatui-text" }

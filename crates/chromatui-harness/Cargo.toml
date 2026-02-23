@@ -1,0 +1,11 @@
+[package]
+name = "chromatui-harness"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chromatui-core = { path = "../chromatui-core" }
+chromatui-render = { path = "../chromatui-render" }
+tempfile.workspace = true
