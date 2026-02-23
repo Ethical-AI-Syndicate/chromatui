@@ -232,6 +232,31 @@ pub struct RuntimeEvidenceReport {
     pub resize_ledger: Vec<ResizeLedgerEntry>,
 }
 
+impl RuntimeEvidenceReport {
+    pub fn explain_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        for frame in &self.frames {
+            let resize_hint = self
+                .resize_ledger
+                .get(frame.step_index.saturating_sub(1))
+                .map(|entry| format!(", lbf={:+.3}, regime={:?}", entry.lbf, entry.regime))
+                .unwrap_or_default();
+
+            lines.push(format!(
+                "step={} event={:?} strategy={:?} bytes={}{}",
+                frame.step_index, frame.event, frame.strategy, frame.bytes_emitted, resize_hint
+            ));
+        }
+
+        lines
+    }
+
+    pub fn explain_text(&self) -> String {
+        self.explain_lines().join("\n")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResizeCoalescer {
     detector: RegimeDetector,
@@ -673,5 +698,29 @@ mod tests {
         assert!(!report.frames.is_empty());
         assert!(!report.resize_ledger.is_empty());
         assert!(report.frames.iter().all(|f| f.step_index > 0));
+    }
+
+    #[test]
+    fn evidence_explain_text_is_human_readable() {
+        let report = RuntimeEvidenceReport {
+            frames: vec![FrameEvidence {
+                step_index: 1,
+                event: Event::Tick,
+                strategy: DiffStrategy::DirtyRow,
+                bytes_emitted: 42,
+            }],
+            resize_ledger: vec![ResizeLedgerEntry {
+                inter_arrival_ms: 20.0,
+                lbf: -0.91,
+                regime: Regime::Burst,
+                applied_now: false,
+            }],
+        };
+
+        let text = report.explain_text();
+        assert!(text.contains("step=1"));
+        assert!(text.contains("strategy=DirtyRow"));
+        assert!(text.contains("lbf=-0.910"));
+        assert!(text.contains("regime=Burst"));
     }
 }
