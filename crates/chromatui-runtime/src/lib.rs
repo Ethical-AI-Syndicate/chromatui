@@ -1,8 +1,22 @@
 use std::collections::HashMap;
 use std::io::Write;
+use std::time::Duration;
 
-use chromatui_core::{Cmd, Effect, Event, Frame, Model, OutputMode, Subscription, TerminalWriter};
-use chromatui_render::{AnsiPresenter, Content, DiffRenderer};
+use chromatui_algorithms::bocpd::{Regime, RegimeDetector};
+use chromatui_core::{
+    Cmd, Effect, Event, Frame, Model, OutputMode, Subscription, TerminalSession, TerminalWriter,
+};
+use chromatui_render::{AnsiPresenter, Content, DiffRenderer, Region};
+
+pub trait EventSource {
+    fn next_event(&mut self, timeout: Duration) -> Option<Event>;
+}
+
+impl EventSource for TerminalSession {
+    fn next_event(&mut self, timeout: Duration) -> Option<Event> {
+        self.poll_event(timeout)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeState {
@@ -76,6 +90,8 @@ impl Default for Runtime {
 pub struct FramePipeline {
     diff: DiffRenderer,
     presenter: AnsiPresenter,
+    selector: BayesianDiffSelector,
+    last_strategy: DiffStrategy,
 }
 
 impl FramePipeline {
@@ -83,6 +99,8 @@ impl FramePipeline {
         Self {
             diff: DiffRenderer::new(width, height),
             presenter: AnsiPresenter::new(),
+            selector: BayesianDiffSelector::new(),
+            last_strategy: DiffStrategy::DirtyRow,
         }
     }
 
@@ -93,7 +111,28 @@ impl FramePipeline {
     pub fn render_frame(&mut self, frame: &Frame) -> Vec<u8> {
         let content = frame_to_content(frame);
         let regions = self.diff.compute_diff(&content);
-        self.presenter.encode_regions(&content, &regions)
+
+        let total_cells = usize::from(frame.width) * usize::from(frame.height);
+        let changed_cells = changed_cells_from_regions(&regions, total_cells);
+        let dirty_rows = dirty_rows_from_regions(&regions);
+
+        let strategy = self
+            .selector
+            .choose_strategy(frame.width, frame.height, dirty_rows);
+        self.last_strategy = strategy;
+
+        self.selector.observe(changed_cells, total_cells);
+
+        let regions_to_render = match strategy {
+            DiffStrategy::FullRedraw => vec![Region::new(0, 0, frame.height, frame.width)],
+            DiffStrategy::FullDiff | DiffStrategy::DirtyRow => regions,
+        };
+
+        self.presenter.encode_regions(&content, &regions_to_render)
+    }
+
+    pub fn last_strategy(&self) -> DiffStrategy {
+        self.last_strategy
     }
 }
 
@@ -101,6 +140,168 @@ impl Default for FramePipeline {
     fn default() -> Self {
         Self::new(80, 24)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffStrategy {
+    FullDiff,
+    DirtyRow,
+    FullRedraw,
+}
+
+#[derive(Debug, Clone)]
+pub struct BayesianDiffSelector {
+    alpha: f64,
+    beta: f64,
+    decay: f64,
+    c_row: f64,
+    c_scan: f64,
+    c_emit: f64,
+}
+
+impl BayesianDiffSelector {
+    pub fn new() -> Self {
+        Self {
+            alpha: 1.0,
+            beta: 19.0,
+            decay: 0.95,
+            c_row: 1.0,
+            c_scan: 1.0,
+            c_emit: 2.0,
+        }
+    }
+
+    pub fn observe(&mut self, changed_cells: usize, scanned_cells: usize) {
+        self.alpha = self.alpha * self.decay + changed_cells as f64;
+        self.beta = self.beta * self.decay + scanned_cells.saturating_sub(changed_cells) as f64;
+    }
+
+    pub fn choose_strategy(&self, width: u16, height: u16, dirty_rows: usize) -> DiffStrategy {
+        let n = (usize::from(width) * usize::from(height)) as f64;
+        let p = self.p95_change_rate();
+        let d = dirty_rows as f64;
+        let w = f64::from(width);
+
+        let full_diff = self.c_row * f64::from(height) + self.c_scan * n + self.c_emit * p * n;
+        let dirty_row = self.c_scan * (d * w) + self.c_emit * p * n;
+        let redraw = self.c_emit * n;
+
+        if redraw <= full_diff && redraw <= dirty_row {
+            DiffStrategy::FullRedraw
+        } else if full_diff <= dirty_row {
+            DiffStrategy::FullDiff
+        } else {
+            DiffStrategy::DirtyRow
+        }
+    }
+
+    fn p95_change_rate(&self) -> f64 {
+        let a = self.alpha.max(1e-9);
+        let b = self.beta.max(1e-9);
+        let mean = a / (a + b);
+        let var = (a * b) / (((a + b) * (a + b)) * (a + b + 1.0));
+        (mean + 1.645 * var.sqrt()).clamp(0.0, 1.0)
+    }
+}
+
+impl Default for BayesianDiffSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResizeLedgerEntry {
+    pub inter_arrival_ms: f64,
+    pub lbf: f64,
+    pub regime: Regime,
+    pub applied_now: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResizeCoalescer {
+    detector: RegimeDetector,
+    last_resize_ms: Option<u64>,
+    pending_resize: Option<(u16, u16)>,
+    ledger: Vec<ResizeLedgerEntry>,
+}
+
+impl ResizeCoalescer {
+    pub fn new() -> Self {
+        Self {
+            detector: RegimeDetector::new(),
+            last_resize_ms: None,
+            pending_resize: None,
+            ledger: Vec::new(),
+        }
+    }
+
+    pub fn observe_resize_at(&mut self, width: u16, height: u16, now_ms: u64) -> bool {
+        let inter_arrival = self
+            .last_resize_ms
+            .map(|prev| now_ms.saturating_sub(prev) as f64)
+            .unwrap_or(200.0);
+        self.last_resize_ms = Some(now_ms);
+
+        self.detector.update(inter_arrival);
+        let regime = self.detector.regime();
+
+        let regime_lbf = match regime {
+            Regime::Steady => 0.8,
+            Regime::Transitional => -0.2,
+            Regime::Burst => -1.2,
+        };
+        let cadence_lbf = ((inter_arrival + 1.0) / 50.0).log10();
+        let lbf = regime_lbf + cadence_lbf;
+        let apply_now = lbf >= 0.0;
+
+        if apply_now {
+            self.pending_resize = None;
+        } else {
+            self.pending_resize = Some((width, height));
+        }
+
+        self.ledger.push(ResizeLedgerEntry {
+            inter_arrival_ms: inter_arrival,
+            lbf,
+            regime,
+            applied_now: apply_now,
+        });
+
+        apply_now
+    }
+
+    pub fn take_pending_resize(&mut self) -> Option<Event> {
+        self.pending_resize.take().map(|(w, h)| Event::Resize(w, h))
+    }
+
+    pub fn last_entry(&self) -> Option<&ResizeLedgerEntry> {
+        self.ledger.last()
+    }
+}
+
+impl Default for ResizeCoalescer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn changed_cells_from_regions(regions: &[Region], max_cells: usize) -> usize {
+    let changed: usize = regions
+        .iter()
+        .map(|r| {
+            usize::from(r.end_row.saturating_sub(r.start_row))
+                * usize::from(r.end_col.saturating_sub(r.start_col))
+        })
+        .sum();
+    changed.min(max_cells)
+}
+
+fn dirty_rows_from_regions(regions: &[Region]) -> usize {
+    regions
+        .iter()
+        .map(|r| usize::from(r.end_row.saturating_sub(r.start_row)))
+        .sum()
 }
 
 pub fn frame_to_content(frame: &Frame) -> Content {
@@ -124,6 +325,7 @@ pub struct DeterministicRuntime<M: Model, W: Write> {
     pipeline: FramePipeline,
     writer: TerminalWriter<W>,
     subscriptions: Vec<Subscription<M>>,
+    resize_coalescer: ResizeCoalescer,
     running: bool,
 }
 
@@ -134,6 +336,7 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             pipeline: FramePipeline::new(width, height),
             writer,
             subscriptions: Vec::new(),
+            resize_coalescer: ResizeCoalescer::new(),
             running: true,
         }
     }
@@ -158,6 +361,14 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         self.subscriptions.len()
     }
 
+    pub fn last_diff_strategy(&self) -> DiffStrategy {
+        self.pipeline.last_strategy()
+    }
+
+    pub fn last_resize_lbf(&self) -> Option<f64> {
+        self.resize_coalescer.last_entry().map(|e| e.lbf)
+    }
+
     pub fn step<V>(&mut self, event: Event, view: V) -> std::io::Result<()>
     where
         V: Fn(&M) -> Frame,
@@ -176,6 +387,49 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         let frame = view(&self.model);
         let ansi = self.pipeline.render_frame(&frame);
         self.writer.write_frame(&ansi)
+    }
+
+    pub fn run_with_source<E, V>(
+        &mut self,
+        source: &mut E,
+        timeout: Duration,
+        max_steps: usize,
+        view: V,
+    ) -> std::io::Result<usize>
+    where
+        E: EventSource,
+        V: Fn(&M) -> Frame,
+    {
+        let mut steps = 0usize;
+        let timeout_ms = timeout.as_millis() as u64;
+        let mut now_ms = 0u64;
+        while self.running && steps < max_steps {
+            let mut event = source.next_event(timeout).unwrap_or(Event::Tick);
+
+            if !matches!(event, Event::Resize(_, _)) {
+                if let Some(pending) = self.resize_coalescer.take_pending_resize() {
+                    self.step(pending, &view)?;
+                    steps += 1;
+                    if !self.running || steps >= max_steps {
+                        break;
+                    }
+                }
+            }
+
+            if let Event::Resize(w, h) = event {
+                if !self.resize_coalescer.observe_resize_at(w, h, now_ms) {
+                    now_ms = now_ms.saturating_add(timeout_ms);
+                    continue;
+                }
+                event = Event::Resize(w, h);
+            }
+
+            self.step(event, &view)?;
+            steps += 1;
+            now_ms = now_ms.saturating_add(timeout_ms);
+        }
+
+        Ok(steps)
     }
 
     fn run_cmd(&mut self, cmd: Cmd<M>) {
@@ -203,6 +457,28 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
 mod tests {
     use super::*;
     use chromatui_core::{Cell, Color, Key};
+
+    struct VecEventSource {
+        events: Vec<Event>,
+        idx: usize,
+    }
+
+    impl VecEventSource {
+        fn new(events: Vec<Event>) -> Self {
+            Self { events, idx: 0 }
+        }
+    }
+
+    impl EventSource for VecEventSource {
+        fn next_event(&mut self, _timeout: Duration) -> Option<Event> {
+            if self.idx >= self.events.len() {
+                return None;
+            }
+            let event = self.events[self.idx].clone();
+            self.idx += 1;
+            Some(event)
+        }
+    }
 
     #[derive(Default)]
     struct LoopModel {
@@ -283,5 +559,51 @@ mod tests {
 
         let content = frame_to_content(&frame);
         assert_eq!(content.lines, vec!["A Z".to_string()]);
+    }
+
+    #[test]
+    fn run_with_source_drives_event_loop_until_quit() {
+        let writer = TerminalWriter::try_new(Vec::<u8>::new(), OutputMode::Inline)
+            .expect("writer should be created");
+        let mut rt = DeterministicRuntime::new(LoopModel::default(), writer, 6, 1);
+        let mut source = VecEventSource::new(vec![
+            Event::Tick,
+            Event::Resize(6, 1),
+            Event::Tick,
+            Event::Key(Key::Char('q')),
+            Event::Tick,
+        ]);
+
+        let steps = rt
+            .run_with_source(&mut source, Duration::from_millis(5), 100, view)
+            .expect("loop should run successfully");
+
+        assert_eq!(steps, 4);
+        assert_eq!(rt.model().count, 2);
+        assert!(!rt.is_running());
+    }
+
+    #[test]
+    fn selector_updates_and_produces_strategy() {
+        let mut sel = BayesianDiffSelector::new();
+        sel.observe(5, 100);
+        let strategy = sel.choose_strategy(80, 24, 2);
+        assert!(matches!(
+            strategy,
+            DiffStrategy::FullDiff | DiffStrategy::DirtyRow | DiffStrategy::FullRedraw
+        ));
+    }
+
+    #[test]
+    fn resize_coalescer_produces_negative_lbf_on_burst() {
+        let mut coalescer = ResizeCoalescer::new();
+        for i in 0..8 {
+            let _ = coalescer.observe_resize_at(100, 40, i * 20);
+        }
+
+        let last = coalescer
+            .last_entry()
+            .expect("resize coalescer should record entries");
+        assert!(last.lbf < 0.0);
     }
 }

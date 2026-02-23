@@ -146,6 +146,7 @@ dependencies = [
 name = "chromatui-runtime"
 version = "0.1.0"
 dependencies = [
+ "chromatui-algorithms",
  "chromatui-core",
  "chromatui-render",
 ]
