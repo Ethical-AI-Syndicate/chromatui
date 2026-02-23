@@ -1,7 +1,9 @@
 pub mod diff;
+pub mod presenter;
 pub mod viewport;
 
 pub use diff::*;
+pub use presenter::*;
 pub use viewport::*;
 
 pub use chromatui_layout::{FlexLayout, GridLayout, LayoutRect, NodeId};
