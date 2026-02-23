@@ -1,10 +1,10 @@
 [package]
-name = "chromatui-render"
+name = "chromatui-declarative"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chromatui-core = { path = "../chromatui-core" }
+chromatui-style = { path = "../chromatui-style" }
 chromatui-layout = { path = "../chromatui-layout" }

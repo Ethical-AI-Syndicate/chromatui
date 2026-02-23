@@ -6,3 +6,4 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+taffy = "0.9"
