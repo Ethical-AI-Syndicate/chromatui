@@ -34,6 +34,24 @@ pub struct Content {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Buffer {
+    pub lines: Vec<String>,
+}
+
+impl Buffer {
+    pub fn from_content(content: &Content) -> Self {
+        Self {
+            lines: content.lines.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferDiff {
+    pub regions: Vec<Region>,
+}
+
 impl Content {
     pub fn new() -> Self {
         Self { lines: Vec::new() }
@@ -105,6 +123,13 @@ impl DiffRenderer {
         self.dirty_regions = regions.clone();
         self.prev_content = Some(new_content.clone());
         regions
+    }
+
+    pub fn compute_buffer_diff(&mut self, buffer: &Buffer) -> BufferDiff {
+        let content = Content::from_lines(buffer.lines.clone());
+        BufferDiff {
+            regions: self.compute_diff(&content),
+        }
     }
 
     pub fn update_size(&mut self, width: u16, height: u16) {

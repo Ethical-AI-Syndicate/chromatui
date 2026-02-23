@@ -1,3 +1,8 @@
+use chromatui_algorithms::bayesian::{BayesianScorer, ScoringEvidence};
+use chromatui_algorithms::fenwick::FenwickTree;
+use chromatui_algorithms::height::BayesianHeightPredictor;
+use chromatui_algorithms::hints::BayesianHintRanker;
+use chromatui_algorithms::hover::CusumHoverStabilizer;
 use chromatui_core::Key;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +570,181 @@ pub struct Checkbox {
     pub state: CheckboxState,
 }
 
+pub struct KeybindingHints {
+    ranker: BayesianHintRanker,
+}
+
+impl KeybindingHints {
+    pub fn new() -> Self {
+        Self {
+            ranker: BayesianHintRanker::new(),
+        }
+    }
+
+    pub fn register(&mut self, id: &str, display_cost: f64) {
+        self.ranker.add_hint(id, display_cost);
+    }
+
+    pub fn observe(&mut self, id: &str, useful: bool) {
+        self.ranker.observe(id, useful);
+    }
+
+    pub fn top_ids(&mut self, n: usize) -> Vec<String> {
+        self.ranker
+            .rank()
+            .into_iter()
+            .take(n)
+            .map(|s| s.id)
+            .collect()
+    }
+}
+
+impl Default for KeybindingHints {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct HoverTargetTracker {
+    current: WidgetId,
+    stabilizer: CusumHoverStabilizer,
+}
+
+pub struct VirtualHeightModel {
+    heights: Vec<f64>,
+    fenwick: FenwickTree,
+    predictor: BayesianHeightPredictor,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandResult {
+    pub title: String,
+    pub score: f64,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandEntry {
+    title: String,
+    tags: Vec<String>,
+}
+
+pub struct CommandPalette {
+    scorer: BayesianScorer,
+    entries: Vec<CommandEntry>,
+}
+
+impl CommandPalette {
+    pub fn new() -> Self {
+        Self {
+            scorer: BayesianScorer::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, title: &str, tags: &[String]) {
+        self.entries.push(CommandEntry {
+            title: title.to_string(),
+            tags: tags.to_vec(),
+        });
+    }
+
+    pub fn search(&self, query: &str) -> Vec<CommandResult> {
+        let mut out: Vec<CommandResult> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let (score, evidence) = self.scorer.score(query, &entry.title, &entry.tags);
+                CommandResult {
+                    title: entry.title.clone(),
+                    score,
+                    evidence: evidence_ledger(&evidence),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score));
+        out
+    }
+}
+
+impl Default for CommandPalette {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn evidence_ledger(e: &ScoringEvidence) -> Vec<String> {
+    vec![
+        format!("match={:?}", e.match_type),
+        format!("word_boundary={:.3}", e.word_boundary_bonus),
+        format!("position={:.3}", e.position_factor),
+        format!("gap={:.3}", e.gap_penalty),
+        format!("tag={:.3}", e.tag_match_bonus),
+        format!("length={:.3}", e.length_factor),
+        format!("log_post={:.3}", e.log_posterior),
+    ]
+}
+
+impl VirtualHeightModel {
+    pub fn new(count: usize, initial_height: f64) -> Self {
+        let heights = vec![initial_height; count];
+        let fenwick = FenwickTree::with_values(&heights);
+        let predictor = BayesianHeightPredictor::new(initial_height, 10.0, 1.0, 0.1);
+        Self {
+            heights,
+            fenwick,
+            predictor,
+        }
+    }
+
+    pub fn observe_height(&mut self, index: usize, measured_height: f64) {
+        if let Some(old) = self.heights.get_mut(index) {
+            let delta = measured_height - *old;
+            *old = measured_height;
+            self.fenwick.update(index, delta);
+            self.predictor.observe(measured_height);
+        }
+    }
+
+    pub fn estimated_prefix_height(&self, index: usize) -> f64 {
+        if self.heights.is_empty() {
+            return 0.0;
+        }
+        let idx = index.min(self.heights.len() - 1);
+        self.fenwick.sum(idx)
+    }
+
+    pub fn predicted_height(&self) -> f64 {
+        self.predictor.posterior_mean()
+    }
+
+    pub fn prediction_interval(&self) -> (f64, f64) {
+        self.predictor.conformal_interval()
+    }
+}
+
+impl HoverTargetTracker {
+    pub fn new(initial: WidgetId, k: f64, h: f64) -> Self {
+        Self {
+            current: initial,
+            stabilizer: CusumHoverStabilizer::new(k, h),
+        }
+    }
+
+    pub fn current(&self) -> WidgetId {
+        self.current
+    }
+
+    pub fn observe_boundary_distance(&mut self, signed_distance: f64, candidate: WidgetId) -> bool {
+        if self.stabilizer.update(signed_distance) {
+            self.current = candidate;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Checkbox {
     pub fn new(id: WidgetId, label: &str) -> Self {
         Self {
@@ -687,5 +867,54 @@ mod tests {
         assert_eq!(checkbox.state, CheckboxState::Checked);
         checkbox.toggle();
         assert_eq!(checkbox.state, CheckboxState::Unchecked);
+    }
+
+    #[test]
+    fn keybinding_hints_rank_by_posterior_value() {
+        let mut hints = KeybindingHints::new();
+        hints.register("copy", 0.1);
+        hints.register("help", 0.1);
+
+        for _ in 0..16 {
+            hints.observe("copy", true);
+            hints.observe("help", false);
+        }
+
+        let ranked = hints.top_ids(2);
+        assert_eq!(ranked[0], "copy");
+    }
+
+    #[test]
+    fn hover_tracker_ignores_small_jitter() {
+        let mut hover = HoverTargetTracker::new(WidgetId::new(1), 0.2, 2.0);
+        for _ in 0..20 {
+            let switched = hover.observe_boundary_distance(0.1, WidgetId::new(2));
+            assert!(!switched);
+            assert_eq!(hover.current(), WidgetId::new(1));
+        }
+    }
+
+    #[test]
+    fn virtual_height_model_predicts_and_updates_offset() {
+        let mut vm = VirtualHeightModel::new(5, 20.0);
+        let before = vm.estimated_prefix_height(4);
+        vm.observe_height(2, 40.0);
+        let after = vm.estimated_prefix_height(4);
+        assert!(after > before);
+
+        let (_lo, hi) = vm.prediction_interval();
+        assert!(hi >= vm.predicted_height());
+    }
+
+    #[test]
+    fn command_palette_ranks_exact_match_first() {
+        let mut cp = CommandPalette::new();
+        cp.register("Open File", &["file".to_string()]);
+        cp.register("Close Panel", &["panel".to_string()]);
+        cp.register("Open Folder", &["folder".to_string()]);
+
+        let ranked = cp.search("Open File");
+        assert_eq!(ranked.first().map(|r| r.title.as_str()), Some("Open File"));
+        assert!(!ranked[0].evidence.is_empty());
     }
 }

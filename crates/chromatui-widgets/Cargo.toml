@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+chromatui-algorithms = { path = "../chromatui-algorithms" }
 chromatui-core = { path = "../chromatui-core" }
 chromatui-render = { path = "../chromatui-render" }
 chromatui-style = { path = "../chromatui-style" }

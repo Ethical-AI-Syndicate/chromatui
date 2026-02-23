@@ -6,4 +6,5 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+chromatui-algorithms = { path = "../chromatui-algorithms" }
 crossterm = { version = "0.29", features = ["events"] }

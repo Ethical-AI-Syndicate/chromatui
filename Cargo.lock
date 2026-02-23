@@ -88,6 +88,7 @@ dependencies = [
 name = "chromatui-core"
 version = "0.1.0"
 dependencies = [
+ "chromatui-algorithms",
  "crossterm",
 ]
 
@@ -173,6 +174,7 @@ version = "0.1.0"
 name = "chromatui-widgets"
 version = "0.1.0"
 dependencies = [
+ "chromatui-algorithms",
  "chromatui-core",
  "chromatui-render",
  "chromatui-style",

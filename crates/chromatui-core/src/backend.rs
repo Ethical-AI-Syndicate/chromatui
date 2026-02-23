@@ -1,4 +1,6 @@
 use crate::types::{Event, Key, MouseButton, MouseEvent, MouseEventType};
+use chromatui_algorithms::capability::CapabilityPosterior;
+use chromatui_algorithms::luminance::is_dark_background;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -48,6 +50,14 @@ impl TerminalBackend for StdoutBackend {
 
 pub struct TerminalSession {
     running: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityProbeReport {
+    pub alt_screen_probability: f64,
+    pub truecolor_probability: f64,
+    pub dark_background_probability: f64,
+    pub prefers_dark: bool,
 }
 
 impl TerminalSession {
@@ -173,11 +183,96 @@ impl TerminalSession {
     pub fn get_size(&self) -> (u16, u16) {
         crossterm::terminal::size().unwrap_or((80, 24))
     }
+
+    pub fn probe_capabilities(&self) -> CapabilityProbeReport {
+        let mut alt = CapabilityPosterior::new(0.7);
+        let mut truecolor = CapabilityPosterior::new(0.6);
+        let mut dark_bg = CapabilityPosterior::new(0.5);
+
+        let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
+        if term.contains("xterm") || term.contains("screen") || term.contains("tmux") {
+            alt.add_log_bf("term-family", 0.8);
+        }
+        if term.contains("256color") {
+            truecolor.add_log_bf("term-256", 0.4);
+        }
+
+        let colorterm = std::env::var("COLORTERM")
+            .unwrap_or_default()
+            .to_lowercase();
+        if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+            truecolor.add_log_bf("colorterm", 1.2);
+        }
+
+        if let Ok(bg) = std::env::var("COLORFGBG") {
+            if let Some(last) = bg.split(';').next_back() {
+                if let Ok(bg_idx) = last.parse::<u8>() {
+                    let (r, g, b) = ansi_index_to_rgb(bg_idx);
+                    if is_dark_background(r, g, b) {
+                        dark_bg.add_log_bf("colorfgbg", 1.0);
+                    } else {
+                        dark_bg.add_log_bf("colorfgbg", -1.0);
+                    }
+                }
+            }
+        }
+
+        let (w, h) = self.get_size();
+        if w >= 80 && h >= 24 {
+            alt.add_log_bf("size", 0.2);
+        }
+
+        let dark_p = dark_bg.probability();
+        CapabilityProbeReport {
+            alt_screen_probability: alt.probability(),
+            truecolor_probability: truecolor.probability(),
+            dark_background_probability: dark_p,
+            prefers_dark: dark_p >= 0.5,
+        }
+    }
+}
+
+fn ansi_index_to_rgb(idx: u8) -> (u8, u8, u8) {
+    match idx {
+        0 => (0, 0, 0),
+        1 => (205, 0, 0),
+        2 => (0, 205, 0),
+        3 => (205, 205, 0),
+        4 => (0, 0, 238),
+        5 => (205, 0, 205),
+        6 => (0, 205, 205),
+        7 => (229, 229, 229),
+        8 => (127, 127, 127),
+        9 => (255, 0, 0),
+        10 => (0, 255, 0),
+        11 => (255, 255, 0),
+        12 => (92, 92, 255),
+        13 => (255, 0, 255),
+        14 => (0, 255, 255),
+        15 => (255, 255, 255),
+        _ => {
+            let v = idx.saturating_mul(10);
+            (v, v, v)
+        }
+    }
 }
 
 impl Default for TerminalSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn capability_probe_returns_probability_bounds() {
+        let session = TerminalSession::new();
+        let caps = session.probe_capabilities();
+        assert!((0.0..=1.0).contains(&caps.alt_screen_probability));
+        assert!((0.0..=1.0).contains(&caps.truecolor_probability));
     }
 }
 

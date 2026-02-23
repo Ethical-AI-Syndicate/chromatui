@@ -45,6 +45,9 @@ A kernel-level TUI foundation for AI development workloads with disciplined runt
 └─────────────────────────────────────┘
 ```
 
+For the full runtime pipeline and algorithm specification, see `docs/architecture.md`.
+Implementation status against that contract is tracked in `docs/conformance-matrix.md`.
+
 ## Usage
 
 ```rust

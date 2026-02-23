@@ -1,12 +1,19 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chromatui_algorithms::bocpd::{Regime, RegimeDetector};
+use chromatui_algorithms::conformal::{ConformalAlerter, MondrianBucket, MondrianRiskGate};
+use chromatui_algorithms::cusum::CusumDetector;
+use chromatui_algorithms::diff::SummedAreaTable;
+use chromatui_algorithms::eprocess::EProcess;
+use chromatui_algorithms::fairness::InputFairnessGuard;
+use chromatui_algorithms::voi::VoiSampler;
 use chromatui_core::{
-    Cmd, Effect, Event, Frame, Model, OutputMode, Subscription, TerminalSession, TerminalWriter,
+    Cmd, Effect, Event, Frame, Model, OutputMode, Subscription, SubscriptionKind, TerminalSession,
+    TerminalWriter,
 };
-use chromatui_render::{AnsiPresenter, Content, DiffRenderer, Region};
+use chromatui_render::{AnsiPresenter, Buffer, BufferDiff, Content, DiffRenderer, Region};
 
 pub trait EventSource {
     fn next_event(&mut self, timeout: Duration) -> Option<Event>;
@@ -91,6 +98,8 @@ pub struct FramePipeline {
     diff: DiffRenderer,
     presenter: AnsiPresenter,
     selector: BayesianDiffSelector,
+    voi_sampler: VoiSampler,
+    now_ms: u64,
     last_strategy: DiffStrategy,
     last_decision: DiffDecisionEvidence,
 }
@@ -101,6 +110,8 @@ impl FramePipeline {
             diff: DiffRenderer::new(width, height),
             presenter: AnsiPresenter::new(),
             selector: BayesianDiffSelector::new(),
+            voi_sampler: VoiSampler::new(),
+            now_ms: 0,
             last_strategy: DiffStrategy::DirtyRow,
             last_decision: DiffDecisionEvidence::default(),
         }
@@ -112,7 +123,9 @@ impl FramePipeline {
 
     pub fn render_frame(&mut self, frame: &Frame) -> Vec<u8> {
         let content = frame_to_content(frame);
-        let regions = self.diff.compute_diff(&content);
+        let buffer = Buffer::from_content(&content);
+        let buffer_diff: BufferDiff = self.diff.compute_buffer_diff(&buffer);
+        let regions = buffer_diff.regions;
 
         let total_cells = usize::from(frame.width) * usize::from(frame.height);
         let changed_cells = changed_cells_from_regions(&regions, total_cells);
@@ -121,11 +134,27 @@ impl FramePipeline {
         let decision = self
             .selector
             .decide_strategy(frame.width, frame.height, dirty_rows);
-        let strategy = decision.strategy;
+        let mut strategy = decision.strategy;
         self.last_strategy = strategy;
         self.last_decision = decision;
 
         self.selector.observe(changed_cells, total_cells);
+
+        self.now_ms = self.now_ms.saturating_add(16);
+        if self.voi_sampler.should_sample(self.now_ms) && matches!(strategy, DiffStrategy::DirtyRow)
+        {
+            strategy = DiffStrategy::FullDiff;
+            self.last_strategy = strategy;
+            self.voi_sampler.mark_sampled(self.now_ms);
+        }
+
+        let dense = regions_to_dense(&regions, frame.width as usize, frame.height as usize);
+        let sat = SummedAreaTable::from_dense(&dense);
+        let density = sat.density(0, 0, frame.width as usize, frame.height as usize);
+        if density > 0.9 {
+            strategy = DiffStrategy::FullRedraw;
+            self.last_strategy = strategy;
+        }
 
         let regions_to_render = match strategy {
             DiffStrategy::FullRedraw => vec![Region::new(0, 0, frame.height, frame.width)],
@@ -219,9 +248,11 @@ impl BayesianDiffSelector {
         let p = self.p95_change_rate();
         let d = dirty_rows as f64;
         let w = f64::from(width);
+        let dirty_scan = d * w;
 
-        let full_diff = self.c_row * f64::from(height) + self.c_scan * n + self.c_emit * p * n;
-        let dirty_row = self.c_scan * (d * w) + self.c_emit * p * n;
+        let full_diff =
+            self.c_row * f64::from(height) + self.c_scan * dirty_scan + self.c_emit * p * n;
+        let dirty_row = self.c_scan * dirty_scan + self.c_emit * p * n;
         let redraw = self.c_emit * n;
 
         let strategy = if redraw <= full_diff && redraw <= dirty_row {
@@ -270,6 +301,14 @@ pub struct FrameEvidence {
     pub event: Event,
     pub strategy: DiffStrategy,
     pub bytes_emitted: usize,
+    pub frame_time_ms: f64,
+    pub predicted_frame_ms: f64,
+    pub risk_upper_bound_ms: f64,
+    pub frame_risky: bool,
+    pub input_fairness: f64,
+    pub forced_yield: bool,
+    pub sequential_alert: bool,
+    pub conformal_alert: bool,
     pub p95_change_rate: f64,
     pub expected_cost_full: f64,
     pub expected_cost_dirty: f64,
@@ -294,11 +333,19 @@ impl RuntimeEvidenceReport {
                 .unwrap_or_default();
 
             lines.push(format!(
-                "step={} event={:?} strategy={:?} bytes={} p95={:.4} full={:.2} dirty={:.2} redraw={:.2}{}",
+                "step={} event={:?} strategy={:?} bytes={} frame_ms={:.3} pred_ms={:.3} ub_ms={:.3} risky={} fairness={:.3} yield={} seq_alert={} conf_alert={} p95={:.4} full={:.2} dirty={:.2} redraw={:.2}{}",
                 frame.step_index,
                 frame.event,
                 frame.strategy,
                 frame.bytes_emitted,
+                frame.frame_time_ms,
+                frame.predicted_frame_ms,
+                frame.risk_upper_bound_ms,
+                frame.frame_risky,
+                frame.input_fairness,
+                frame.forced_yield,
+                frame.sequential_alert,
+                frame.conformal_alert,
                 frame.p95_change_rate,
                 frame.expected_cost_full,
                 frame.expected_cost_dirty,
@@ -343,13 +390,16 @@ impl ResizeCoalescer {
         self.detector.update(inter_arrival);
         let regime = self.detector.regime();
 
-        let regime_lbf = match regime {
-            Regime::Steady => 0.8,
-            Regime::Transitional => -0.2,
-            Regime::Burst => -1.2,
+        let steady_mean = 200.0;
+        let burst_mean = 20.0;
+        let p_x_given_steady = exp_pdf(inter_arrival, steady_mean);
+        let p_x_given_burst = exp_pdf(inter_arrival, burst_mean);
+        let regime_prior = match regime {
+            Regime::Steady => 2.0,
+            Regime::Transitional => 1.0,
+            Regime::Burst => 0.5,
         };
-        let cadence_lbf = ((inter_arrival + 1.0) / 50.0).log10();
-        let lbf = regime_lbf + cadence_lbf;
+        let lbf = ((p_x_given_steady * regime_prior) / p_x_given_burst.max(1e-12)).log10();
         let apply_now = lbf >= 0.0;
 
         if apply_now {
@@ -383,6 +433,11 @@ impl Default for ResizeCoalescer {
     }
 }
 
+fn exp_pdf(x: f64, mean: f64) -> f64 {
+    let lambda = 1.0 / mean.max(1e-9);
+    lambda * (-lambda * x.max(0.0)).exp()
+}
+
 fn changed_cells_from_regions(regions: &[Region], max_cells: usize) -> usize {
     let changed: usize = regions
         .iter()
@@ -392,6 +447,22 @@ fn changed_cells_from_regions(regions: &[Region], max_cells: usize) -> usize {
         })
         .sum();
     changed.min(max_cells)
+}
+
+fn regions_to_dense(regions: &[Region], width: usize, height: usize) -> Vec<Vec<bool>> {
+    let mut dense = vec![vec![false; width]; height];
+    for r in regions {
+        let y0 = r.start_row as usize;
+        let y1 = r.end_row as usize;
+        let x0 = r.start_col as usize;
+        let x1 = r.end_col as usize;
+        for row in dense.iter_mut().take(y1.min(height)).skip(y0.min(height)) {
+            for cell in row.iter_mut().take(x1.min(width)).skip(x0.min(width)) {
+                *cell = true;
+            }
+        }
+    }
+    dense
 }
 
 fn dirty_rows_from_regions(regions: &[Region]) -> usize {
@@ -422,7 +493,16 @@ pub struct DeterministicRuntime<M: Model, W: Write> {
     pipeline: FramePipeline,
     writer: TerminalWriter<W>,
     subscriptions: Vec<Subscription<M>>,
+    subscription_last_fire_ms: HashMap<usize, u64>,
     resize_coalescer: ResizeCoalescer,
+    risk_gate: MondrianRiskGate,
+    frame_budget_ms: f64,
+    predicted_frame_ms: f64,
+    fairness_guard: InputFairnessGuard,
+    frame_cusum: CusumDetector,
+    frame_eprocess: EProcess,
+    frame_conformal: ConformalAlerter,
+    force_yield: bool,
     evidence: RuntimeEvidenceReport,
     step_counter: usize,
     running: bool,
@@ -435,7 +515,16 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             pipeline: FramePipeline::new(width, height),
             writer,
             subscriptions: Vec::new(),
+            subscription_last_fire_ms: HashMap::new(),
             resize_coalescer: ResizeCoalescer::new(),
+            risk_gate: MondrianRiskGate::new(0.1),
+            frame_budget_ms: 16.7,
+            predicted_frame_ms: 16.7,
+            fairness_guard: InputFairnessGuard::new(),
+            frame_cusum: CusumDetector::with_params(0.5, 5.0, 0.0),
+            frame_eprocess: EProcess::with_params(0.1, 0.0),
+            frame_conformal: ConformalAlerter::new(0.1),
+            force_yield: false,
             evidence: RuntimeEvidenceReport::default(),
             step_counter: 0,
             running: true,
@@ -497,10 +586,43 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         self.run_cmd(cmd);
 
         let frame = view(&self.model);
+        let frame_start = Instant::now();
         let ansi = self.pipeline.render_frame(&frame);
         let strategy = self.pipeline.last_strategy();
         let decision = self.pipeline.last_decision();
         self.writer.write_frame(&ansi)?;
+        let observed_frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+
+        let bucket = MondrianBucket {
+            mode: format!("{:?}", self.writer.mode()),
+            diff: format!("{:?}", strategy),
+            size: frame_size_bucket(frame.width, frame.height).to_string(),
+        };
+        self.risk_gate
+            .update(bucket.clone(), observed_frame_ms, self.predicted_frame_ms);
+        let ub_ms = self
+            .risk_gate
+            .risk_upper_bound(&bucket, self.predicted_frame_ms);
+        let risky = self
+            .risk_gate
+            .is_risky(&bucket, self.predicted_frame_ms, self.frame_budget_ms);
+
+        self.predicted_frame_ms = 0.8 * self.predicted_frame_ms + 0.2 * observed_frame_ms;
+        let fairness = self.fairness_guard.fairness();
+
+        let delta = observed_frame_ms - self.frame_budget_ms;
+        let cusum_alarm = self.frame_cusum.update(delta);
+        let wealth = self
+            .frame_eprocess
+            .update(delta / self.frame_budget_ms.max(1e-6));
+        let e_alarm = wealth >= 20.0;
+        let sequential_alert = (cusum_alarm && e_alarm) || e_alarm;
+
+        self.frame_conformal
+            .update(observed_frame_ms, self.predicted_frame_ms);
+        let conformal_alert = self
+            .frame_conformal
+            .alerts(observed_frame_ms, self.predicted_frame_ms);
 
         self.step_counter = self.step_counter.saturating_add(1);
         self.evidence.frames.push(FrameEvidence {
@@ -508,6 +630,14 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             event: observed_event,
             strategy,
             bytes_emitted: ansi.len(),
+            frame_time_ms: observed_frame_ms,
+            predicted_frame_ms: self.predicted_frame_ms,
+            risk_upper_bound_ms: ub_ms,
+            frame_risky: risky,
+            input_fairness: fairness,
+            forced_yield: self.force_yield,
+            sequential_alert,
+            conformal_alert,
             p95_change_rate: decision.p95_change_rate,
             expected_cost_full: decision.expected_cost_full,
             expected_cost_dirty: decision.expected_cost_dirty,
@@ -532,7 +662,15 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         let timeout_ms = timeout.as_millis() as u64;
         let mut now_ms = 0u64;
         while self.running && steps < max_steps {
-            let mut event = source.next_event(timeout).unwrap_or(Event::Tick);
+            let mut event = self
+                .next_subscription_event(now_ms)
+                .or_else(|| source.next_event(timeout))
+                .unwrap_or(Event::Tick);
+            self.fairness_guard.observe(event_source_name(&event));
+            self.force_yield = self.fairness_guard.should_yield(timeout.as_millis() as u64);
+            if self.force_yield {
+                std::thread::yield_now();
+            }
 
             if !matches!(event, Event::Resize(_, _)) {
                 if let Some(pending) = self.resize_coalescer.take_pending_resize() {
@@ -585,12 +723,57 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
     pub fn into_writer(self) -> W {
         self.writer.into_inner()
     }
+
+    fn next_subscription_event(&mut self, now_ms: u64) -> Option<Event> {
+        for (idx, sub) in self.subscriptions.iter().enumerate() {
+            if let SubscriptionKind::Tick(interval) = &sub.kind {
+                let interval_ms = interval.as_millis() as u64;
+                let last = self
+                    .subscription_last_fire_ms
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(0);
+                if now_ms.saturating_sub(last) >= interval_ms {
+                    self.subscription_last_fire_ms.insert(idx, now_ms);
+                    return Some(Event::Tick);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn event_source_name(event: &Event) -> &'static str {
+    match event {
+        Event::Key(_) => "key",
+        Event::Mouse(_) => "mouse",
+        Event::Resize(_, _) => "resize",
+        Event::Timer(_) => "timer",
+        Event::Tick => "tick",
+    }
+}
+
+fn frame_size_bucket(width: u16, height: u16) -> &'static str {
+    let n = usize::from(width) * usize::from(height);
+    if n < 2_000 {
+        "small"
+    } else if n < 8_000 {
+        "medium"
+    } else {
+        "large"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chromatui_core::{Cell, Color, Key};
+    use std::sync::{Mutex, OnceLock};
+
+    fn writer_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct VecEventSource {
         events: Vec<Event>,
@@ -663,6 +846,9 @@ mod tests {
 
     #[test]
     fn loop_enforces_effects_and_writer_output() {
+        let _guard = writer_test_lock()
+            .lock()
+            .expect("writer test lock should not be poisoned");
         let writer = TerminalWriter::try_new(Vec::<u8>::new(), OutputMode::Inline)
             .expect("writer should be created");
         let mut rt = DeterministicRuntime::new(LoopModel::default(), writer, 6, 1);
@@ -697,6 +883,9 @@ mod tests {
 
     #[test]
     fn run_with_source_drives_event_loop_until_quit() {
+        let _guard = writer_test_lock()
+            .lock()
+            .expect("writer test lock should not be poisoned");
         let writer = TerminalWriter::try_new(Vec::<u8>::new(), OutputMode::Inline)
             .expect("writer should be created");
         let mut rt = DeterministicRuntime::new(LoopModel::default(), writer, 6, 1);
@@ -745,6 +934,9 @@ mod tests {
 
     #[test]
     fn evidence_report_contains_frame_and_resize_entries() {
+        let _guard = writer_test_lock()
+            .lock()
+            .expect("writer test lock should not be poisoned");
         let writer = TerminalWriter::try_new(Vec::<u8>::new(), OutputMode::Inline)
             .expect("writer should be created");
         let mut rt = DeterministicRuntime::new(LoopModel::default(), writer, 6, 1);
@@ -773,10 +965,18 @@ mod tests {
                 event: Event::Tick,
                 strategy: DiffStrategy::DirtyRow,
                 bytes_emitted: 42,
+                frame_time_ms: 7.5,
+                predicted_frame_ms: 8.0,
+                risk_upper_bound_ms: 12.0,
+                frame_risky: false,
+                input_fairness: 1.0,
+                forced_yield: false,
                 p95_change_rate: 0.12,
                 expected_cost_full: 20.0,
                 expected_cost_dirty: 10.0,
                 expected_cost_redraw: 30.0,
+                sequential_alert: false,
+                conformal_alert: false,
             }],
             resize_ledger: vec![ResizeLedgerEntry {
                 inter_arrival_ms: 20.0,
@@ -789,8 +989,18 @@ mod tests {
         let text = report.explain_text();
         assert!(text.contains("step=1"));
         assert!(text.contains("strategy=DirtyRow"));
+        assert!(text.contains("frame_ms=7.500"));
         assert!(text.contains("p95=0.1200"));
         assert!(text.contains("lbf=-0.910"));
         assert!(text.contains("regime=Burst"));
+    }
+
+    #[test]
+    fn diff_selector_full_cost_uses_dirty_scan_area() {
+        let sel = BayesianDiffSelector::new();
+        let decision = sel.decide_strategy(100, 20, 2);
+        let expected_gap = 20.0;
+        let actual_gap = decision.expected_cost_full - decision.expected_cost_dirty;
+        assert!((actual_gap - expected_gap).abs() < 1e-9);
     }
 }
