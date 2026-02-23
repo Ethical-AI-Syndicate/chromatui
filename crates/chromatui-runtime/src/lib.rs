@@ -92,6 +92,7 @@ pub struct FramePipeline {
     presenter: AnsiPresenter,
     selector: BayesianDiffSelector,
     last_strategy: DiffStrategy,
+    last_decision: DiffDecisionEvidence,
 }
 
 impl FramePipeline {
@@ -101,6 +102,7 @@ impl FramePipeline {
             presenter: AnsiPresenter::new(),
             selector: BayesianDiffSelector::new(),
             last_strategy: DiffStrategy::DirtyRow,
+            last_decision: DiffDecisionEvidence::default(),
         }
     }
 
@@ -116,10 +118,12 @@ impl FramePipeline {
         let changed_cells = changed_cells_from_regions(&regions, total_cells);
         let dirty_rows = dirty_rows_from_regions(&regions);
 
-        let strategy = self
+        let decision = self
             .selector
-            .choose_strategy(frame.width, frame.height, dirty_rows);
+            .decide_strategy(frame.width, frame.height, dirty_rows);
+        let strategy = decision.strategy;
         self.last_strategy = strategy;
+        self.last_decision = decision;
 
         self.selector.observe(changed_cells, total_cells);
 
@@ -134,6 +138,10 @@ impl FramePipeline {
     pub fn last_strategy(&self) -> DiffStrategy {
         self.last_strategy
     }
+
+    pub fn last_decision(&self) -> DiffDecisionEvidence {
+        self.last_decision.clone()
+    }
 }
 
 impl Default for FramePipeline {
@@ -147,6 +155,27 @@ pub enum DiffStrategy {
     FullDiff,
     DirtyRow,
     FullRedraw,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffDecisionEvidence {
+    pub strategy: DiffStrategy,
+    pub p95_change_rate: f64,
+    pub expected_cost_full: f64,
+    pub expected_cost_dirty: f64,
+    pub expected_cost_redraw: f64,
+}
+
+impl Default for DiffDecisionEvidence {
+    fn default() -> Self {
+        Self {
+            strategy: DiffStrategy::DirtyRow,
+            p95_change_rate: 0.05,
+            expected_cost_full: 0.0,
+            expected_cost_dirty: 0.0,
+            expected_cost_redraw: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +206,15 @@ impl BayesianDiffSelector {
     }
 
     pub fn choose_strategy(&self, width: u16, height: u16, dirty_rows: usize) -> DiffStrategy {
+        self.decide_strategy(width, height, dirty_rows).strategy
+    }
+
+    pub fn decide_strategy(
+        &self,
+        width: u16,
+        height: u16,
+        dirty_rows: usize,
+    ) -> DiffDecisionEvidence {
         let n = (usize::from(width) * usize::from(height)) as f64;
         let p = self.p95_change_rate();
         let d = dirty_rows as f64;
@@ -186,12 +224,20 @@ impl BayesianDiffSelector {
         let dirty_row = self.c_scan * (d * w) + self.c_emit * p * n;
         let redraw = self.c_emit * n;
 
-        if redraw <= full_diff && redraw <= dirty_row {
+        let strategy = if redraw <= full_diff && redraw <= dirty_row {
             DiffStrategy::FullRedraw
         } else if full_diff <= dirty_row {
             DiffStrategy::FullDiff
         } else {
             DiffStrategy::DirtyRow
+        };
+
+        DiffDecisionEvidence {
+            strategy,
+            p95_change_rate: p,
+            expected_cost_full: full_diff,
+            expected_cost_dirty: dirty_row,
+            expected_cost_redraw: redraw,
         }
     }
 
@@ -224,6 +270,10 @@ pub struct FrameEvidence {
     pub event: Event,
     pub strategy: DiffStrategy,
     pub bytes_emitted: usize,
+    pub p95_change_rate: f64,
+    pub expected_cost_full: f64,
+    pub expected_cost_dirty: f64,
+    pub expected_cost_redraw: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -244,8 +294,16 @@ impl RuntimeEvidenceReport {
                 .unwrap_or_default();
 
             lines.push(format!(
-                "step={} event={:?} strategy={:?} bytes={}{}",
-                frame.step_index, frame.event, frame.strategy, frame.bytes_emitted, resize_hint
+                "step={} event={:?} strategy={:?} bytes={} p95={:.4} full={:.2} dirty={:.2} redraw={:.2}{}",
+                frame.step_index,
+                frame.event,
+                frame.strategy,
+                frame.bytes_emitted,
+                frame.p95_change_rate,
+                frame.expected_cost_full,
+                frame.expected_cost_dirty,
+                frame.expected_cost_redraw,
+                resize_hint
             ));
         }
 
@@ -441,6 +499,7 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
         let frame = view(&self.model);
         let ansi = self.pipeline.render_frame(&frame);
         let strategy = self.pipeline.last_strategy();
+        let decision = self.pipeline.last_decision();
         self.writer.write_frame(&ansi)?;
 
         self.step_counter = self.step_counter.saturating_add(1);
@@ -449,6 +508,10 @@ impl<M: Model, W: Write> DeterministicRuntime<M, W> {
             event: observed_event,
             strategy,
             bytes_emitted: ansi.len(),
+            p95_change_rate: decision.p95_change_rate,
+            expected_cost_full: decision.expected_cost_full,
+            expected_cost_dirty: decision.expected_cost_dirty,
+            expected_cost_redraw: decision.expected_cost_redraw,
         });
 
         Ok(())
@@ -659,10 +722,12 @@ mod tests {
         let mut sel = BayesianDiffSelector::new();
         sel.observe(5, 100);
         let strategy = sel.choose_strategy(80, 24, 2);
+        let decision = sel.decide_strategy(80, 24, 2);
         assert!(matches!(
             strategy,
             DiffStrategy::FullDiff | DiffStrategy::DirtyRow | DiffStrategy::FullRedraw
         ));
+        assert!((0.0..=1.0).contains(&decision.p95_change_rate));
     }
 
     #[test]
@@ -708,6 +773,10 @@ mod tests {
                 event: Event::Tick,
                 strategy: DiffStrategy::DirtyRow,
                 bytes_emitted: 42,
+                p95_change_rate: 0.12,
+                expected_cost_full: 20.0,
+                expected_cost_dirty: 10.0,
+                expected_cost_redraw: 30.0,
             }],
             resize_ledger: vec![ResizeLedgerEntry {
                 inter_arrival_ms: 20.0,
@@ -720,6 +789,7 @@ mod tests {
         let text = report.explain_text();
         assert!(text.contains("step=1"));
         assert!(text.contains("strategy=DirtyRow"));
+        assert!(text.contains("p95=0.1200"));
         assert!(text.contains("lbf=-0.910"));
         assert!(text.contains("regime=Burst"));
     }
